@@ -1479,8 +1479,9 @@ def reports_tab():
 
     df = fetch_timesheets(year, month)
     exp_df = fetch_expenses(year, month)
+    pp = fetch_payee_payouts(year, month)
     
-    if df.empty and exp_df.empty:
+    if df.empty and exp_df.empty and pp.empty:
         st.info("No data for selected month.")
     else:
         # Process timesheet data
@@ -1507,6 +1508,9 @@ def reports_tab():
                 "amount": safe_float(r["amount"]),
             })
 
+        # Calculate total payee payouts
+        total_payee_payouts = pp["amount"].sum() if not pp.empty else 0.0
+
         # Show expense summary
         if not exp_df.empty:
             st.markdown("**Expenses Summary**")
@@ -1523,11 +1527,20 @@ def reports_tab():
         if not df.empty:
             rep = pd.DataFrame(rows)
             by_client = rep.groupby("client_name").agg({"revenue": "sum", "payroll": "sum"})
-            by_client["profit"] = by_client["revenue"] - by_client["payroll"]
+            
+            # Calculate payee payouts by client
+            if not pp.empty:
+                payee_by_client = pp.groupby("client_name")["amount"].sum()
+                by_client["payee_payouts"] = by_client.index.map(lambda x: payee_by_client.get(x, 0.0))
+            else:
+                by_client["payee_payouts"] = 0.0
+            
+            # Updated profit calculation: revenue - payroll - payee_payouts
+            by_client["profit"] = by_client["revenue"] - by_client["payroll"] - by_client["payee_payouts"]
 
             st.markdown("**Labor Summary by client**")
             fmt = by_client.copy()
-            for col in ["revenue", "payroll", "profit"]:
+            for col in ["revenue", "payroll", "payee_payouts", "profit"]:
                 fmt[col] = fmt[col].map(dollars)
             st.dataframe(fmt, use_container_width=True)
 
@@ -1547,7 +1560,6 @@ def reports_tab():
 
     st.divider()
     st.subheader("Payee Payouts (Finder Fees)")
-    pp = fetch_payee_payouts(year, month)
     if pp.empty:
         st.info("No payee rules or no matching hours this month.")
     else:
@@ -1561,6 +1573,14 @@ def reports_tab():
         sum_payee = pp.groupby("payee_name")["amount"].sum().reset_index()
         sum_payee["amount"] = sum_payee["amount"].map(dollars)
         st.dataframe(sum_payee, use_container_width=True)
+
+        # Show total payee payouts
+        st.markdown("**Total Payee Payouts**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Total Payee Payouts", dollars(total_payee_payouts))
+        with col2:
+            st.metric("Number of Payees", len(sum_payee))
 
         if st.button("Create Payee Payouts PDF", key="rp_payee_pdf"):
             rows = pp.to_dict(orient="records")
