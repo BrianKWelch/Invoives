@@ -14,6 +14,7 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
+import bcrypt
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -59,13 +60,29 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
+    # Users table for authentication
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS contractors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
             default_bill_rate REAL NOT NULL,
-            default_pay_rate REAL NOT NULL
+            default_pay_rate REAL NOT NULL,
+            UNIQUE (user_id, name),
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
@@ -74,9 +91,12 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
             address TEXT DEFAULT '',
-            email TEXT DEFAULT ''
+            email TEXT DEFAULT '',
+            UNIQUE (user_id, name),
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
@@ -100,13 +120,15 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS timesheets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             contractor_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
             hours REAL NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE (contractor_id, client_id, year, month),
+            UNIQUE (user_id, contractor_id, client_id, year, month),
+            FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(contractor_id) REFERENCES contractors(id),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
@@ -117,13 +139,15 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
             total_amount REAL NOT NULL,
             pdf_path TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE (client_id, year, month),
+            UNIQUE (user_id, client_id, year, month),
+            FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
         """
@@ -134,8 +158,11 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS payees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            email TEXT DEFAULT ''
+            user_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            email TEXT DEFAULT '',
+            UNIQUE (user_id, name),
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
@@ -160,6 +187,7 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
@@ -167,6 +195,7 @@ def init_db():
             description TEXT DEFAULT '',
             amount REAL NOT NULL,
             created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
         """
@@ -176,10 +205,12 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS company_info (
             id INTEGER PRIMARY KEY DEFAULT 1,
+            user_id INTEGER NOT NULL UNIQUE,
             name TEXT NOT NULL DEFAULT 'Your Company Name',
             address TEXT DEFAULT '',
             phone TEXT DEFAULT '',
-            email TEXT DEFAULT ''
+            email TEXT DEFAULT '',
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
         """
     )
@@ -200,24 +231,178 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # Column already exists
     
-    # Insert default company info if not exists
-    cur.execute(
-        """
-        INSERT OR IGNORE INTO company_info (id, name, address, phone, email, bank_name, account_number, routing_number)
-        VALUES (1, 'Your Company Name', '123 Business Street\\nYour City, State 12345', '(555) 123-4567', 'your@email.com', 'Your Bank Name', 'XXXX-XXXX-XXXX', 'XXXX-XXXX-X')
-        """
-    )
-
+    # Note: company_info will be created per user on first access
+    
     conn.commit()
     conn.close()
 
 
+# -----------------------------
+# Authentication functions
+# -----------------------------
+
+def hash_password(password: str) -> str:
+    """Hash a password using bcrypt"""
+    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    """Verify a password against its hash"""
+    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
+
+
+def register_user(username: str, email: str, password: str) -> tuple[bool, str]:
+    """Register a new user. Returns (success, message)"""
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    try:
+        # Check if username already exists
+        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        if cur.fetchone():
+            conn.close()
+            return False, "Username already exists"
+        
+        # Check if email already exists
+        cur.execute("SELECT id FROM users WHERE email = ?", (email,))
+        if cur.fetchone():
+            conn.close()
+            return False, "Email already exists"
+        
+        # Create user
+        password_hash = hash_password(password)
+        created_at = datetime.utcnow().isoformat()
+        cur.execute(
+            "INSERT INTO users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
+            (username, email, password_hash, created_at)
+        )
+        user_id = cur.lastrowid
+        
+        # Create default company info for this user
+        cur.execute(
+            """
+            INSERT INTO company_info (user_id, name, address, phone, email, bank_name, account_number, routing_number)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, 'Your Company Name', '', '', '', '', '', '')
+        )
+        
+        conn.commit()
+        conn.close()
+        return True, "Registration successful!"
+    
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return False, f"Registration failed: {str(e)}"
+
+
+def login_user(username: str, password: str) -> tuple[bool, Optional[int], str]:
+    """Login a user. Returns (success, user_id, message)"""
+    conn = get_conn()
+    cur = conn.cursor()
+    
+    try:
+        cur.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
+        result = cur.fetchone()
+        
+        if not result:
+            conn.close()
+            return False, None, "Invalid username or password"
+        
+        user_id, password_hash = result
+        
+        if not verify_password(password, password_hash):
+            conn.close()
+            return False, None, "Invalid username or password"
+        
+        conn.close()
+        return True, user_id, "Login successful!"
+    
+    except Exception as e:
+        conn.close()
+        return False, None, f"Login failed: {str(e)}"
+
+
+def get_current_user_id() -> Optional[int]:
+    """Get the current logged-in user ID from session state"""
+    return st.session_state.get('user_id')
+
+
+def is_authenticated() -> bool:
+    """Check if user is authenticated"""
+    return get_current_user_id() is not None
+
+
+def logout_user():
+    """Logout the current user"""
+    if 'user_id' in st.session_state:
+        del st.session_state['user_id']
+    if 'username' in st.session_state:
+        del st.session_state['username']
+
+
+def show_auth_page():
+    """Show login/registration page"""
+    st.title("Solo Invoicing App")
+    
+    tab1, tab2 = st.tabs(["Login", "Register"])
+    
+    with tab1:
+        st.subheader("Login")
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submit = st.form_submit_button("Login")
+            
+            if submit:
+                if username and password:
+                    success, user_id, message = login_user(username, password)
+                    if success:
+                        st.session_state['user_id'] = user_id
+                        st.session_state['username'] = username
+                        st.success(message)
+                        st.rerun()
+                    else:
+                        st.error(message)
+                else:
+                    st.error("Please enter both username and password")
+    
+    with tab2:
+        st.subheader("Register New Account")
+        with st.form("register_form"):
+            username = st.text_input("Username", key="register_username")
+            email = st.text_input("Email", key="register_email")
+            password = st.text_input("Password", type="password", key="register_password")
+            password_confirm = st.text_input("Confirm Password", type="password", key="register_password_confirm")
+            submit = st.form_submit_button("Register")
+            
+            if submit:
+                if not username or not email or not password:
+                    st.error("Please fill in all fields")
+                elif password != password_confirm:
+                    st.error("Passwords do not match")
+                elif len(password) < 6:
+                    st.error("Password must be at least 6 characters long")
+                else:
+                    success, message = register_user(username, email, password)
+                    if success:
+                        st.success(message)
+                        st.info("You can now login with your credentials")
+                    else:
+                        st.error(message)
+
+
 @st.cache_data(show_spinner=False)
 def list_contractors():
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, default_bill_rate AS bill_rate, default_pay_rate AS pay_rate FROM contractors ORDER BY name",
+        "SELECT id, name, default_bill_rate AS bill_rate, default_pay_rate AS pay_rate FROM contractors WHERE user_id = ? ORDER BY name",
         conn,
+        params=(user_id,),
     )
     conn.close()
     return df
@@ -225,10 +410,14 @@ def list_contractors():
 
 @st.cache_data(show_spinner=False)
 def list_clients():
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, address, email FROM clients ORDER BY name",
+        "SELECT id, name, address, email FROM clients WHERE user_id = ? ORDER BY name",
         conn,
+        params=(user_id,),
     )
     conn.close()
     return df
@@ -236,114 +425,152 @@ def list_clients():
 
 @st.cache_data(show_spinner=False)
 def list_payees():
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, email FROM payees ORDER BY name",
+        "SELECT id, name, email FROM payees WHERE user_id = ? ORDER BY name",
         conn,
+        params=(user_id,),
     )
     conn.close()
     return df
 
 
 def upsert_contractor(name: str, bill: float, pay: float):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO contractors(name, default_bill_rate, default_pay_rate)
-        VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET
+        INSERT INTO contractors(user_id, name, default_bill_rate, default_pay_rate)
+        VALUES (?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET
         default_bill_rate=excluded.default_bill_rate,
         default_pay_rate=excluded.default_pay_rate
         """,
-        (name.strip(), bill, pay),
+        (user_id, name.strip(), bill, pay),
     )
     conn.commit()
     conn.close()
+    list_contractors.clear()
 
 
 def update_contractor(contractor_id: int, name: str, bill: float, pay: float):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE contractors SET name=?, default_bill_rate=?, default_pay_rate=? WHERE id=?",
-        (name.strip(), bill, pay, contractor_id),
+        "UPDATE contractors SET name=?, default_bill_rate=?, default_pay_rate=? WHERE id=? AND user_id=?",
+        (name.strip(), bill, pay, contractor_id, user_id),
     )
     conn.commit()
     conn.close()
+    list_contractors.clear()
 
 
 def delete_contractor(contractor_id: int):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM timesheets WHERE contractor_id=?", (contractor_id,))
+    # Delete related records
+    cur.execute("DELETE FROM timesheets WHERE contractor_id=? AND user_id=?", (contractor_id, user_id))
     cur.execute("DELETE FROM assignments WHERE contractor_id=?", (contractor_id,))
     cur.execute("DELETE FROM payee_rules WHERE contractor_id=?", (contractor_id,))
-    cur.execute("DELETE FROM contractors WHERE id=?", (contractor_id,))
+    cur.execute("DELETE FROM contractors WHERE id=? AND user_id=?", (contractor_id, user_id))
     conn.commit()
     conn.close()
+    list_contractors.clear()
 
 
 def upsert_client(name: str, address: str, email: str):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO clients(name, address, email)
-        VALUES (?, ?, ?) ON CONFLICT(name) DO UPDATE SET
+        INSERT INTO clients(user_id, name, address, email)
+        VALUES (?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET
         address=excluded.address,
         email=excluded.email
         """,
-        (name.strip(), address.strip(), email.strip()),
+        (user_id, name.strip(), address.strip(), email.strip()),
     )
     conn.commit()
     conn.close()
+    list_clients.clear()
 
 
 def update_client(client_id: int, name: str, address: str, email: str):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE clients SET name=?, address=?, email=? WHERE id=?",
-        (name.strip(), address.strip(), email.strip(), client_id),
+        "UPDATE clients SET name=?, address=?, email=? WHERE id=? AND user_id=?",
+        (name.strip(), address.strip(), email.strip(), client_id, user_id),
     )
     conn.commit()
     conn.close()
+    list_clients.clear()
 
 
 def delete_client(client_id: int):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM timesheets WHERE client_id=?", (client_id,))
+    cur.execute("DELETE FROM timesheets WHERE client_id=? AND user_id=?", (client_id, user_id))
     cur.execute("DELETE FROM assignments WHERE client_id=?", (client_id,))
-    cur.execute("DELETE FROM invoices WHERE client_id=?", (client_id,))
+    cur.execute("DELETE FROM invoices WHERE client_id=? AND user_id=?", (client_id, user_id))
+    cur.execute("DELETE FROM expenses WHERE client_id=? AND user_id=?", (client_id, user_id))
     cur.execute("DELETE FROM payee_rules WHERE client_id=?", (client_id,))
-    cur.execute("DELETE FROM clients WHERE id=?", (client_id,))
+    cur.execute("DELETE FROM clients WHERE id=? AND user_id=?", (client_id, user_id))
     conn.commit()
     conn.close()
+    list_clients.clear()
 
 
 def upsert_payee(name: str, email: str = ""):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO payees(name, email)
-        VALUES(?, ?)
-        ON CONFLICT(name) DO UPDATE SET email=excluded.email
+        INSERT INTO payees(user_id, name, email)
+        VALUES(?, ?, ?)
+        ON CONFLICT(user_id, name) DO UPDATE SET email=excluded.email
         """,
-        (name.strip(), email.strip()),
+        (user_id, name.strip(), email.strip()),
     )
     conn.commit()
     conn.close()
+    list_payees.clear()
 
 
 def delete_payee(payee_id: int):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM payee_rules WHERE payee_id=?", (payee_id,))
-    cur.execute("DELETE FROM payees WHERE id=?", (payee_id,))
+    cur.execute("DELETE FROM payees WHERE id=? AND user_id=?", (payee_id, user_id))
     conn.commit()
     conn.close()
+    list_payees.clear()
 
 
 def set_payee_rule(payee_id: int, contractor_id: int, client_id: int, amount_per_hour: float):
@@ -385,6 +612,9 @@ def delete_payee_rule(rule_id: int):
 
 def fetch_payee_rules():
     """Fetch all payee rules with names for display"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     q = """
         SELECT 
@@ -397,17 +627,20 @@ def fetch_payee_rules():
             c.name AS contractor_name,
             cl.name AS client_name
         FROM payee_rules pr
-        JOIN payees p ON p.id = pr.payee_id
-        JOIN contractors c ON c.id = pr.contractor_id
-        JOIN clients cl ON cl.id = pr.client_id
+        JOIN payees p ON p.id = pr.payee_id AND p.user_id = ?
+        JOIN contractors c ON c.id = pr.contractor_id AND c.user_id = ?
+        JOIN clients cl ON cl.id = pr.client_id AND cl.user_id = ?
         ORDER BY p.name, cl.name, c.name
     """
-    df = pd.read_sql_query(q, conn)
+    df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id))
     conn.close()
     return df
 
 
 def fetch_payee_payouts(year: int, month: int):
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     q = """
         SELECT
@@ -420,31 +653,35 @@ def fetch_payee_payouts(year: int, month: int):
             pr.amount_per_hour,
             (COALESCE(ts.hours,0) * COALESCE(pr.amount_per_hour,0)) AS amount
         FROM payee_rules pr
-        JOIN payees p  ON p.id  = pr.payee_id
-        JOIN contractors c ON c.id = pr.contractor_id
-        JOIN clients cl     ON cl.id = pr.client_id
+        JOIN payees p  ON p.id  = pr.payee_id AND p.user_id = ?
+        JOIN contractors c ON c.id = pr.contractor_id AND c.user_id = ?
+        JOIN clients cl     ON cl.id = pr.client_id AND cl.user_id = ?
         LEFT JOIN timesheets ts
           ON ts.contractor_id = pr.contractor_id
          AND ts.client_id     = pr.client_id
+         AND ts.user_id       = ?
          AND ts.year = ?
          AND ts.month = ?
         ORDER BY p.name, cl.name, c.name
     """
-    df = pd.read_sql_query(q, conn, params=(year, month))
+    df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, user_id, year, month))
     conn.close()
     return df
 
 
 def save_expense(client_id: int, year: int, month: int, category: str, description: str, amount: float):
     """Save an expense entry"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO expenses(client_id, year, month, category, description, amount, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO expenses(user_id, client_id, year, month, category, description, amount, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (client_id, year, month, category.strip(), description.strip(), amount, datetime.utcnow().isoformat()),
+        (user_id, client_id, year, month, category.strip(), description.strip(), amount, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -452,6 +689,9 @@ def save_expense(client_id: int, year: int, month: int, category: str, descripti
 
 def fetch_expenses(year: int, month: int, client_id: int | None = None):
     """Fetch expenses for a given month and optionally filtered by client"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     if client_id:
         q = """
@@ -459,31 +699,34 @@ def fetch_expenses(year: int, month: int, client_id: int | None = None):
                    cl.name AS client_name
             FROM expenses e
             JOIN clients cl ON cl.id = e.client_id
-            WHERE e.year=? AND e.month=? AND e.client_id=?
+            WHERE e.user_id=? AND e.year=? AND e.month=? AND e.client_id=?
             ORDER BY e.category, e.description
         """
-        df = pd.read_sql_query(q, conn, params=(year, month, client_id))
+        df = pd.read_sql_query(q, conn, params=(user_id, year, month, client_id))
     else:
         q = """
             SELECT e.id, e.client_id, e.year, e.month, e.category, e.description, e.amount,
                    cl.name AS client_name
             FROM expenses e
             JOIN clients cl ON cl.id = e.client_id
-            WHERE e.year=? AND e.month=?
+            WHERE e.user_id=? AND e.year=? AND e.month=?
             ORDER BY cl.name, e.category, e.description
         """
-        df = pd.read_sql_query(q, conn, params=(year, month))
+        df = pd.read_sql_query(q, conn, params=(user_id, year, month))
     conn.close()
     return df
 
 
 def update_expense(expense_id: int, category: str, description: str, amount: float):
     """Update an expense entry"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE expenses SET category=?, description=?, amount=? WHERE id=?",
-        (category.strip(), description.strip(), amount, expense_id),
+        "UPDATE expenses SET category=?, description=?, amount=? WHERE id=? AND user_id=?",
+        (category.strip(), description.strip(), amount, expense_id, user_id),
     )
     conn.commit()
     conn.close()
@@ -491,18 +734,32 @@ def update_expense(expense_id: int, category: str, description: str, amount: flo
 
 def delete_expense(expense_id: int):
     """Delete an expense entry"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
+    cur.execute("DELETE FROM expenses WHERE id=? AND user_id=?", (expense_id, user_id))
     conn.commit()
     conn.close()
 
 
 def get_company_info():
     """Get company information"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return {
+            "name": "Your Company Name",
+            "address": "",
+            "phone": "",
+            "email": "",
+            "bank_name": "",
+            "account_number": "",
+            "routing_number": ""
+        }
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT name, address, phone, email, bank_name, account_number, routing_number FROM company_info WHERE id = 1")
+    cur.execute("SELECT name, address, phone, email, bank_name, account_number, routing_number FROM company_info WHERE user_id = ?", (user_id,))
     row = cur.fetchone()
     conn.close()
     if row:
@@ -528,13 +785,16 @@ def get_company_info():
 
 def update_company_info(name: str, address: str, phone: str, email: str, bank_name: str = "", account_number: str = "", routing_number: str = ""):
     """Update company information"""
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO company_info (id, name, address, phone, email, bank_name, account_number, routing_number)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
+        INSERT INTO company_info (user_id, name, address, phone, email, bank_name, account_number, routing_number)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
         name=excluded.name,
         address=excluded.address,
         phone=excluded.phone,
@@ -543,7 +803,7 @@ def update_company_info(name: str, address: str, phone: str, email: str, bank_na
         account_number=excluded.account_number,
         routing_number=excluded.routing_number
         """,
-        (name.strip(), address.strip(), phone.strip(), email.strip(), bank_name.strip(), account_number.strip(), routing_number.strip()),
+        (user_id, name.strip(), address.strip(), phone.strip(), email.strip(), bank_name.strip(), account_number.strip(), routing_number.strip()),
     )
     conn.commit()
     conn.close()
@@ -599,6 +859,9 @@ def generate_payee_payouts_pdf(rows: list[dict], year: int, month: int) -> str:
 
 
 def resolve_rates(contractor_id: int, client_id: int):
+    user_id = get_current_user_id()
+    if not user_id:
+        return 0.0, 0.0
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -608,9 +871,9 @@ def resolve_rates(contractor_id: int, client_id: int):
             COALESCE(a.pay_rate, c.default_pay_rate) AS pay_rate
         FROM contractors c
         LEFT JOIN assignments a ON a.contractor_id = c.id AND a.client_id = ?
-        WHERE c.id = ?
+        WHERE c.id = ? AND c.user_id = ?
         """,
-        (client_id, contractor_id),
+        (client_id, contractor_id, user_id),
     )
     row = cur.fetchone()
     conn.close()
@@ -620,46 +883,52 @@ def resolve_rates(contractor_id: int, client_id: int):
 
 
 def save_timesheet(contractor_id: int, client_id: int, year: int, month: int, hours: float):
+    user_id = get_current_user_id()
+    if not user_id:
+        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO timesheets(contractor_id, client_id, year, month, hours, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(contractor_id, client_id, year, month) DO UPDATE SET
+        INSERT INTO timesheets(user_id, contractor_id, client_id, year, month, hours, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, contractor_id, client_id, year, month) DO UPDATE SET
         hours = excluded.hours,
         created_at = excluded.created_at
         """,
-        (contractor_id, client_id, year, month, hours, datetime.utcnow().isoformat()),
+        (user_id, contractor_id, client_id, year, month, hours, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
 
 
 def fetch_timesheets(year: int, month: int, client_id: int | None = None):
+    user_id = get_current_user_id()
+    if not user_id:
+        return pd.DataFrame()
     conn = get_conn()
     if client_id:
         q = """
             SELECT ts.id, ts.contractor_id, ts.client_id, ts.year, ts.month, ts.hours,
                    c.name AS contractor_name, cl.name AS client_name
             FROM timesheets ts
-            JOIN contractors c ON c.id = ts.contractor_id
-            JOIN clients cl ON cl.id = ts.client_id
-            WHERE ts.year=? AND ts.month=? AND ts.client_id=?
+            JOIN contractors c ON c.id = ts.contractor_id AND c.user_id = ?
+            JOIN clients cl ON cl.id = ts.client_id AND cl.user_id = ?
+            WHERE ts.user_id=? AND ts.year=? AND ts.month=? AND ts.client_id=?
             ORDER BY contractor_name
         """
-        df = pd.read_sql_query(q, conn, params=(year, month, client_id))
+        df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, year, month, client_id))
     else:
         q = """
             SELECT ts.id, ts.contractor_id, ts.client_id, ts.year, ts.month, ts.hours,
                    c.name AS contractor_name, cl.name AS client_name
             FROM timesheets ts
-            JOIN contractors c ON c.id = ts.contractor_id
-            JOIN clients cl ON cl.id = ts.client_id
-            WHERE ts.year=? AND ts.month=?
+            JOIN contractors c ON c.id = ts.contractor_id AND c.user_id = ?
+            JOIN clients cl ON cl.id = ts.client_id AND cl.user_id = ?
+            WHERE ts.user_id=? AND ts.year=? AND ts.month=?
             ORDER BY client_name, contractor_name
         """
-        df = pd.read_sql_query(q, conn, params=(year, month))
+        df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, year, month))
     conn.close()
     return df
 
@@ -1454,17 +1723,19 @@ def invoice_tab():
             expense_total = sum([safe_float(exp["amount"]) for exp in expense_items])
             total_amount = labor_total + expense_total
             
-            cur.execute(
-                """
-                INSERT INTO invoices(client_id, year, month, total_amount, pdf_path, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(client_id, year, month) DO UPDATE SET
-                total_amount=excluded.total_amount,
-                pdf_path=excluded.pdf_path,
-                created_at=excluded.created_at
-                """,
-                (int(client_row["id"]), year, month, float(total_amount), path, datetime.utcnow().isoformat()),
-            )
+            user_id = get_current_user_id()
+            if user_id:
+                cur.execute(
+                    """
+                    INSERT INTO invoices(user_id, client_id, year, month, total_amount, pdf_path, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, client_id, year, month) DO UPDATE SET
+                    total_amount=excluded.total_amount,
+                    pdf_path=excluded.pdf_path,
+                    created_at=excluded.created_at
+                    """,
+                    (user_id, int(client_row["id"]), year, month, float(total_amount), path, datetime.utcnow().isoformat()),
+                )
             conn.commit()
             conn.close()
 
@@ -1655,8 +1926,21 @@ def seed_example():
 
 def main():
     st.set_page_config(page_title="Solo Invoicing", layout="wide")
-    st.title("Solo Invoicing and Payments")
     init_db()
+    
+    # Check authentication
+    if not is_authenticated():
+        show_auth_page()
+        return
+    
+    # User is authenticated - show main app
+    st.title("Solo Invoicing and Payments")
+    username = st.session_state.get('username', 'User')
+    st.sidebar.markdown(f"**Logged in as:** {username}")
+    
+    if st.sidebar.button("Logout", key="logout_btn"):
+        logout_user()
+        st.rerun()
 
     with st.sidebar:
         st.markdown("**Quick actions**")
@@ -1665,7 +1949,7 @@ def main():
             st.success("Sample data loaded for Sept 2025 (includes contractors, clients, hours, and expenses)")
             list_contractors.clear()
             list_clients.clear()
-        st.caption("Data is stored locally in data.db. PDFs are saved to the invoices, payables, and payees folders.")
+        st.caption("Data is stored on the server. PDFs are saved to the invoices, payables, and payees folders.")
 
     tabs = st.tabs(["Setup", "Enter Hours & Expenses", "Generate Invoice", "Reports"])
     with tabs[0]:
