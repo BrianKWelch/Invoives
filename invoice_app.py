@@ -6,6 +6,7 @@
 # - NEW: Payees (finder fees) with rules + payouts PDF
 # - NEW: Billing types support - hourly or monthly fixed billing
 # - NEW: Multiple banks support - assign specific bank per client for invoice remit-to
+# - NEW: Authentication system with self-registration - users can create their own accounts
 
 import os
 import sqlite3
@@ -54,52 +55,142 @@ def check_authentication():
         st.session_state.authenticated = False
     return st.session_state.authenticated
 
-def authenticate_user(username: str, password: str) -> bool:
-    """Authenticate user against secrets"""
+def register_user(username: str, password: str) -> tuple[bool, str]:
+    """Register a new user in the database"""
+    if not username or not username.strip():
+        return False, "Username cannot be empty"
+    if not password or len(password) < 4:
+        return False, "Password must be at least 4 characters"
+    
+    username = username.strip().lower()
+    password_hash = hash_password(password)
+    
     try:
-        # Get credentials from Streamlit secrets
-        # Structure: secrets["users"][username] = password_hash
+        conn = get_conn()
+        cur = conn.cursor()
+        # Check if username already exists
+        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        if cur.fetchone():
+            conn.close()
+            return False, "Username already exists. Please choose a different one."
+        
+        # Insert new user
+        cur.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, password_hash, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        conn.close()
+        return True, "Registration successful! You can now login."
+    except sqlite3.Error as e:
+        return False, f"Registration error: {str(e)}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against secrets and database"""
+    if not username or not password:
+        return False
+    
+    username = username.strip().lower()
+    password_hash = hash_password(password)
+    
+    # First, check Streamlit secrets (for admin/pre-configured users)
+    try:
         if "users" in st.secrets:
             users = st.secrets["users"]
             if username in users:
                 stored_hash = users[username]
-                password_hash = hash_password(password)
                 if password_hash == stored_hash:
                     st.session_state.authenticated = True
                     st.session_state.username = username
                     return True
-        return False
     except Exception:
-        # If secrets not configured, allow a default for development
-        # IMPORTANT: Set proper secrets in production!
-        default_user = os.getenv("DEFAULT_USER", "admin")
+        pass  # Secrets not configured, continue to database check
+    
+    # Second, check database (for self-registered users)
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
+        result = cur.fetchone()
+        conn.close()
+        
+        if result and result[0] == password_hash:
+            st.session_state.authenticated = True
+            st.session_state.username = username
+            return True
+    except Exception:
+        pass  # Database error, authentication fails
+    
+    # Fallback for development (only if no other auth configured)
+    try:
+        default_user = os.getenv("DEFAULT_USER", "")
         default_pass = os.getenv("DEFAULT_PASS", "")
         if username == default_user and password == default_pass and default_pass:
             st.session_state.authenticated = True
             st.session_state.username = username
             return True
-        return False
+    except Exception:
+        pass
+    
+    return False
 
 def show_login_page():
-    """Display login page"""
+    """Display login page with registration option"""
     st.set_page_config(page_title="Solo Invoicing - Login", layout="centered")
-    st.title("🔐 Solo Invoicing Login")
-    st.markdown("---")
     
-    with st.form("login_form"):
-        username = st.text_input("Username", key="login_username")
-        password = st.text_input("Password", type="password", key="login_password")
-        submit = st.form_submit_button("Login")
+    # Create tabs for Login and Register
+    tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
+    
+    with tab1:
+        st.title("Solo Invoicing Login")
+        st.markdown("---")
         
-        if submit:
-            if authenticate_user(username, password):
-                st.success("Login successful!")
-                st.rerun()
-            else:
-                st.error("Invalid username or password")
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submit = st.form_submit_button("Login", use_container_width=True)
+            
+            if submit:
+                if authenticate_user(username, password):
+                    st.success("Login successful!")
+                    st.rerun()
+                else:
+                    st.error("Invalid username or password")
+        
+        st.markdown("---")
+        st.caption("Don't have an account? Go to the Register tab above.")
     
-    st.markdown("---")
-    st.caption("Please enter your credentials to access the invoicing system.")
+    with tab2:
+        st.title("Create New Account")
+        st.markdown("---")
+        st.info("💡 Create your account to get started. Each user has their own isolated database.")
+        
+        with st.form("register_form"):
+            reg_username = st.text_input("Choose Username", key="reg_username", 
+                                         help="Username will be converted to lowercase")
+            reg_password = st.text_input("Choose Password", type="password", key="reg_password",
+                                         help="Must be at least 4 characters")
+            reg_password_confirm = st.text_input("Confirm Password", type="password", key="reg_password_confirm")
+            submit_register = st.form_submit_button("Register", use_container_width=True)
+            
+            if submit_register:
+                # Validation
+                if reg_password != reg_password_confirm:
+                    st.error("Passwords do not match!")
+                elif len(reg_password) < 4:
+                    st.error("Password must be at least 4 characters long!")
+                else:
+                    success, message = register_user(reg_username, reg_password)
+                    if success:
+                        st.success(message)
+                        st.info("🔄 Switch to the Login tab to sign in.")
+                    else:
+                        st.error(message)
+        
+        st.markdown("---")
+        st.caption("Already have an account? Go to the Login tab above.")
 
 # -----------------------------
 # Utilities
@@ -306,6 +397,18 @@ def init_db():
             amount REAL NOT NULL,
             created_at TEXT NOT NULL,
             FOREIGN KEY(client_id) REFERENCES clients(id)
+        )
+        """
+    )
+
+    # NEW: Users table for self-registration
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
         )
         """
     )
