@@ -4,6 +4,8 @@
 # - Safe formatting for None/empty rates to avoid TypeError
 # - Contractors, Clients, Rate overrides, Hour entry, Invoice PDF, Payables PDF, Reports
 # - NEW: Payees (finder fees) with rules + payouts PDF
+# - NEW: Billing types support - hourly or monthly fixed billing
+# - NEW: Multiple banks support - assign specific bank per client for invoice remit-to
 
 import os
 import sqlite3
@@ -14,7 +16,6 @@ from typing import Optional
 
 import pandas as pd
 import streamlit as st
-import bcrypt
 from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
@@ -60,43 +61,31 @@ def init_db():
     conn = get_conn()
     cur = conn.cursor()
 
-    # Users table for authentication
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-        """
-    )
-
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS contractors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
+            name TEXT UNIQUE NOT NULL,
             default_bill_rate REAL NOT NULL,
             default_pay_rate REAL NOT NULL,
-            UNIQUE (user_id, name),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            billing_type TEXT NOT NULL DEFAULT 'hourly'
         )
         """
     )
+    
+    # Add billing_type column if it doesn't exist (for existing databases)
+    try:
+        cur.execute("ALTER TABLE contractors ADD COLUMN billing_type TEXT NOT NULL DEFAULT 'hourly'")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
 
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS clients (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
+            name TEXT UNIQUE NOT NULL,
             address TEXT DEFAULT '',
-            email TEXT DEFAULT '',
-            UNIQUE (user_id, name),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            email TEXT DEFAULT ''
         )
         """
     )
@@ -120,15 +109,13 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS timesheets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
             contractor_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
             hours REAL NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE (user_id, contractor_id, client_id, year, month),
-            FOREIGN KEY(user_id) REFERENCES users(id),
+            UNIQUE (contractor_id, client_id, year, month),
             FOREIGN KEY(contractor_id) REFERENCES contractors(id),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
@@ -139,15 +126,13 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS invoices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
             total_amount REAL NOT NULL,
             pdf_path TEXT NOT NULL,
             created_at TEXT NOT NULL,
-            UNIQUE (user_id, client_id, year, month),
-            FOREIGN KEY(user_id) REFERENCES users(id),
+            UNIQUE (client_id, year, month),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
         """
@@ -158,11 +143,8 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS payees (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            email TEXT DEFAULT '',
-            UNIQUE (user_id, name),
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            name TEXT UNIQUE NOT NULL,
+            email TEXT DEFAULT ''
         )
         """
     )
@@ -187,7 +169,6 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS expenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
             client_id INTEGER NOT NULL,
             year INTEGER NOT NULL,
             month INTEGER NOT NULL,
@@ -195,7 +176,6 @@ def init_db():
             description TEXT DEFAULT '',
             amount REAL NOT NULL,
             created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(client_id) REFERENCES clients(id)
         )
         """
@@ -205,12 +185,10 @@ def init_db():
         """
         CREATE TABLE IF NOT EXISTS company_info (
             id INTEGER PRIMARY KEY DEFAULT 1,
-            user_id INTEGER NOT NULL UNIQUE,
             name TEXT NOT NULL DEFAULT 'Your Company Name',
             address TEXT DEFAULT '',
             phone TEXT DEFAULT '',
-            email TEXT DEFAULT '',
-            FOREIGN KEY(user_id) REFERENCES users(id)
+            email TEXT DEFAULT ''
         )
         """
     )
@@ -230,179 +208,44 @@ def init_db():
         cur.execute("ALTER TABLE company_info ADD COLUMN routing_number TEXT DEFAULT ''")
     except sqlite3.OperationalError:
         pass  # Column already exists
+
+    # NEW: Banks table for multiple bank options
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS banks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            bank_name TEXT NOT NULL,
+            account_number TEXT NOT NULL,
+            routing_number TEXT NOT NULL
+        )
+        """
+    )
     
-    # Note: company_info will be created per user on first access
+    # Add bank_id to clients if it doesn't exist (for existing databases)
+    try:
+        cur.execute("ALTER TABLE clients ADD COLUMN bank_id INTEGER REFERENCES banks(id)")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
+    # Insert default company info if not exists
+    cur.execute(
+        """
+        INSERT OR IGNORE INTO company_info (id, name, address, phone, email, bank_name, account_number, routing_number)
+        VALUES (1, 'Your Company Name', '123 Business Street\\nYour City, State 12345', '(555) 123-4567', 'your@email.com', 'Your Bank Name', 'XXXX-XXXX-XXXX', 'XXXX-XXXX-X')
+        """
+    )
+
     conn.commit()
     conn.close()
 
 
-# -----------------------------
-# Authentication functions
-# -----------------------------
-
-def hash_password(password: str) -> str:
-    """Hash a password using bcrypt"""
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
-
-
-def verify_password(password: str, password_hash: str) -> bool:
-    """Verify a password against its hash"""
-    return bcrypt.checkpw(password.encode('utf-8'), password_hash.encode('utf-8'))
-
-
-def register_user(username: str, email: str, password: str) -> tuple[bool, str]:
-    """Register a new user. Returns (success, message)"""
-    conn = get_conn()
-    cur = conn.cursor()
-    
-    try:
-        # Check if username already exists
-        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
-        if cur.fetchone():
-            conn.close()
-            return False, "Username already exists"
-        
-        # Check if email already exists
-        cur.execute("SELECT id FROM users WHERE email = ?", (email,))
-        if cur.fetchone():
-            conn.close()
-            return False, "Email already exists"
-        
-        # Create user
-        password_hash = hash_password(password)
-        created_at = datetime.utcnow().isoformat()
-        cur.execute(
-            "INSERT INTO users (username, email, password_hash, created_at) VALUES (?, ?, ?, ?)",
-            (username, email, password_hash, created_at)
-        )
-        user_id = cur.lastrowid
-        
-        # Create default company info for this user
-        cur.execute(
-            """
-            INSERT INTO company_info (user_id, name, address, phone, email, bank_name, account_number, routing_number)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (user_id, 'Your Company Name', '', '', '', '', '', '')
-        )
-        
-        conn.commit()
-        conn.close()
-        return True, "Registration successful!"
-    
-    except Exception as e:
-        conn.rollback()
-        conn.close()
-        return False, f"Registration failed: {str(e)}"
-
-
-def login_user(username: str, password: str) -> tuple[bool, Optional[int], str]:
-    """Login a user. Returns (success, user_id, message)"""
-    conn = get_conn()
-    cur = conn.cursor()
-    
-    try:
-        cur.execute("SELECT id, password_hash FROM users WHERE username = ?", (username,))
-        result = cur.fetchone()
-        
-        if not result:
-            conn.close()
-            return False, None, "Invalid username or password"
-        
-        user_id, password_hash = result
-        
-        if not verify_password(password, password_hash):
-            conn.close()
-            return False, None, "Invalid username or password"
-        
-        conn.close()
-        return True, user_id, "Login successful!"
-    
-    except Exception as e:
-        conn.close()
-        return False, None, f"Login failed: {str(e)}"
-
-
-def get_current_user_id() -> Optional[int]:
-    """Get the current logged-in user ID from session state"""
-    return st.session_state.get('user_id')
-
-
-def is_authenticated() -> bool:
-    """Check if user is authenticated"""
-    return get_current_user_id() is not None
-
-
-def logout_user():
-    """Logout the current user"""
-    if 'user_id' in st.session_state:
-        del st.session_state['user_id']
-    if 'username' in st.session_state:
-        del st.session_state['username']
-
-
-def show_auth_page():
-    """Show login/registration page"""
-    st.title("Solo Invoicing App")
-    
-    tab1, tab2 = st.tabs(["Login", "Register"])
-    
-    with tab1:
-        st.subheader("Login")
-        with st.form("login_form"):
-            username = st.text_input("Username", key="login_username")
-            password = st.text_input("Password", type="password", key="login_password")
-            submit = st.form_submit_button("Login")
-            
-            if submit:
-                if username and password:
-                    success, user_id, message = login_user(username, password)
-                    if success:
-                        st.session_state['user_id'] = user_id
-                        st.session_state['username'] = username
-                        st.success(message)
-                        st.rerun()
-                    else:
-                        st.error(message)
-                else:
-                    st.error("Please enter both username and password")
-    
-    with tab2:
-        st.subheader("Register New Account")
-        with st.form("register_form"):
-            username = st.text_input("Username", key="register_username")
-            email = st.text_input("Email", key="register_email")
-            password = st.text_input("Password", type="password", key="register_password")
-            password_confirm = st.text_input("Confirm Password", type="password", key="register_password_confirm")
-            submit = st.form_submit_button("Register")
-            
-            if submit:
-                if not username or not email or not password:
-                    st.error("Please fill in all fields")
-                elif password != password_confirm:
-                    st.error("Passwords do not match")
-                elif len(password) < 6:
-                    st.error("Password must be at least 6 characters long")
-                else:
-                    success, message = register_user(username, email, password)
-                    if success:
-                        st.success(message)
-                        st.info("You can now login with your credentials")
-                    else:
-                        st.error(message)
-
-
 @st.cache_data(show_spinner=False)
 def list_contractors():
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, default_bill_rate AS bill_rate, default_pay_rate AS pay_rate FROM contractors WHERE user_id = ? ORDER BY name",
+        "SELECT id, name, default_bill_rate AS bill_rate, default_pay_rate AS pay_rate, billing_type FROM contractors ORDER BY name",
         conn,
-        params=(user_id,),
     )
     conn.close()
     return df
@@ -410,14 +253,10 @@ def list_contractors():
 
 @st.cache_data(show_spinner=False)
 def list_clients():
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, address, email FROM clients WHERE user_id = ? ORDER BY name",
+        "SELECT id, name, address, email, bank_id FROM clients ORDER BY name",
         conn,
-        params=(user_id,),
     )
     conn.close()
     return df
@@ -425,152 +264,185 @@ def list_clients():
 
 @st.cache_data(show_spinner=False)
 def list_payees():
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     df = pd.read_sql_query(
-        "SELECT id, name, email FROM payees WHERE user_id = ? ORDER BY name",
+        "SELECT id, name, email FROM payees ORDER BY name",
         conn,
-        params=(user_id,),
     )
     conn.close()
     return df
 
 
-def upsert_contractor(name: str, bill: float, pay: float):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
+@st.cache_data(show_spinner=False)
+def list_banks():
+    conn = get_conn()
+    df = pd.read_sql_query(
+        "SELECT id, name, bank_name, account_number, routing_number FROM banks ORDER BY name",
+        conn,
+    )
+    conn.close()
+    return df
+
+
+def upsert_bank(name: str, bank_name: str, account_number: str, routing_number: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO contractors(user_id, name, default_bill_rate, default_pay_rate)
-        VALUES (?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET
-        default_bill_rate=excluded.default_bill_rate,
-        default_pay_rate=excluded.default_pay_rate
+        INSERT INTO banks(name, bank_name, account_number, routing_number)
+        VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET
+        bank_name=excluded.bank_name,
+        account_number=excluded.account_number,
+        routing_number=excluded.routing_number
         """,
-        (user_id, name.strip(), bill, pay),
+        (name.strip(), bank_name.strip(), account_number.strip(), routing_number.strip()),
     )
     conn.commit()
     conn.close()
-    list_contractors.clear()
 
 
-def update_contractor(contractor_id: int, name: str, bill: float, pay: float):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
+def update_bank(bank_id: int, name: str, bank_name: str, account_number: str, routing_number: str):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE contractors SET name=?, default_bill_rate=?, default_pay_rate=? WHERE id=? AND user_id=?",
-        (name.strip(), bill, pay, contractor_id, user_id),
+        "UPDATE banks SET name=?, bank_name=?, account_number=?, routing_number=? WHERE id=?",
+        (name.strip(), bank_name.strip(), account_number.strip(), routing_number.strip(), bank_id),
     )
     conn.commit()
     conn.close()
-    list_contractors.clear()
+
+
+def delete_bank(bank_id: int):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("UPDATE clients SET bank_id=NULL WHERE bank_id=?", (bank_id,))
+    cur.execute("DELETE FROM banks WHERE id=?", (bank_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_bank_info(bank_id: int):
+    """Get bank information by ID"""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, name, bank_name, account_number, routing_number FROM banks WHERE id=?",
+        (bank_id,)
+    )
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {
+            "id": row[0],
+            "name": row[1],
+            "bank_name": row[2],
+            "account_number": row[3],
+            "routing_number": row[4]
+        }
+    return None
+
+
+def upsert_contractor(name: str, bill: float, pay: float, billing_type: str = "hourly"):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO contractors(name, default_bill_rate, default_pay_rate, billing_type)
+        VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET
+        default_bill_rate=excluded.default_bill_rate,
+        default_pay_rate=excluded.default_pay_rate,
+        billing_type=excluded.billing_type
+        """,
+        (name.strip(), bill, pay, billing_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+def update_contractor(contractor_id: int, name: str, bill: float, pay: float, billing_type: str = "hourly"):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE contractors SET name=?, default_bill_rate=?, default_pay_rate=?, billing_type=? WHERE id=?",
+        (name.strip(), bill, pay, billing_type, contractor_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 def delete_contractor(contractor_id: int):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
-    # Delete related records
-    cur.execute("DELETE FROM timesheets WHERE contractor_id=? AND user_id=?", (contractor_id, user_id))
+    cur.execute("DELETE FROM timesheets WHERE contractor_id=?", (contractor_id,))
     cur.execute("DELETE FROM assignments WHERE contractor_id=?", (contractor_id,))
     cur.execute("DELETE FROM payee_rules WHERE contractor_id=?", (contractor_id,))
-    cur.execute("DELETE FROM contractors WHERE id=? AND user_id=?", (contractor_id, user_id))
+    cur.execute("DELETE FROM contractors WHERE id=?", (contractor_id,))
     conn.commit()
     conn.close()
-    list_contractors.clear()
 
 
-def upsert_client(name: str, address: str, email: str):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
+def upsert_client(name: str, address: str, email: str, bank_id: int | None = None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO clients(user_id, name, address, email)
-        VALUES (?, ?, ?, ?) ON CONFLICT(user_id, name) DO UPDATE SET
+        INSERT INTO clients(name, address, email, bank_id)
+        VALUES (?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET
         address=excluded.address,
-        email=excluded.email
+        email=excluded.email,
+        bank_id=excluded.bank_id
         """,
-        (user_id, name.strip(), address.strip(), email.strip()),
+        (name.strip(), address.strip(), email.strip(), bank_id),
     )
     conn.commit()
     conn.close()
-    list_clients.clear()
 
 
-def update_client(client_id: int, name: str, address: str, email: str):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
+def update_client(client_id: int, name: str, address: str, email: str, bank_id: int | None = None):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE clients SET name=?, address=?, email=? WHERE id=? AND user_id=?",
-        (name.strip(), address.strip(), email.strip(), client_id, user_id),
+        "UPDATE clients SET name=?, address=?, email=?, bank_id=? WHERE id=?",
+        (name.strip(), address.strip(), email.strip(), bank_id, client_id),
     )
     conn.commit()
     conn.close()
-    list_clients.clear()
 
 
 def delete_client(client_id: int):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM timesheets WHERE client_id=? AND user_id=?", (client_id, user_id))
+    cur.execute("DELETE FROM timesheets WHERE client_id=?", (client_id,))
     cur.execute("DELETE FROM assignments WHERE client_id=?", (client_id,))
-    cur.execute("DELETE FROM invoices WHERE client_id=? AND user_id=?", (client_id, user_id))
-    cur.execute("DELETE FROM expenses WHERE client_id=? AND user_id=?", (client_id, user_id))
+    cur.execute("DELETE FROM invoices WHERE client_id=?", (client_id,))
     cur.execute("DELETE FROM payee_rules WHERE client_id=?", (client_id,))
-    cur.execute("DELETE FROM clients WHERE id=? AND user_id=?", (client_id, user_id))
+    cur.execute("DELETE FROM clients WHERE id=?", (client_id,))
     conn.commit()
     conn.close()
-    list_clients.clear()
 
 
 def upsert_payee(name: str, email: str = ""):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO payees(user_id, name, email)
-        VALUES(?, ?, ?)
-        ON CONFLICT(user_id, name) DO UPDATE SET email=excluded.email
+        INSERT INTO payees(name, email)
+        VALUES(?, ?)
+        ON CONFLICT(name) DO UPDATE SET email=excluded.email
         """,
-        (user_id, name.strip(), email.strip()),
+        (name.strip(), email.strip()),
     )
     conn.commit()
     conn.close()
-    list_payees.clear()
 
 
 def delete_payee(payee_id: int):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("DELETE FROM payee_rules WHERE payee_id=?", (payee_id,))
-    cur.execute("DELETE FROM payees WHERE id=? AND user_id=?", (payee_id, user_id))
+    cur.execute("DELETE FROM payees WHERE id=?", (payee_id,))
     conn.commit()
     conn.close()
-    list_payees.clear()
 
 
 def set_payee_rule(payee_id: int, contractor_id: int, client_id: int, amount_per_hour: float):
@@ -612,9 +484,6 @@ def delete_payee_rule(rule_id: int):
 
 def fetch_payee_rules():
     """Fetch all payee rules with names for display"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     q = """
         SELECT 
@@ -627,20 +496,17 @@ def fetch_payee_rules():
             c.name AS contractor_name,
             cl.name AS client_name
         FROM payee_rules pr
-        JOIN payees p ON p.id = pr.payee_id AND p.user_id = ?
-        JOIN contractors c ON c.id = pr.contractor_id AND c.user_id = ?
-        JOIN clients cl ON cl.id = pr.client_id AND cl.user_id = ?
+        JOIN payees p ON p.id = pr.payee_id
+        JOIN contractors c ON c.id = pr.contractor_id
+        JOIN clients cl ON cl.id = pr.client_id
         ORDER BY p.name, cl.name, c.name
     """
-    df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id))
+    df = pd.read_sql_query(q, conn)
     conn.close()
     return df
 
 
 def fetch_payee_payouts(year: int, month: int):
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     q = """
         SELECT
@@ -653,35 +519,31 @@ def fetch_payee_payouts(year: int, month: int):
             pr.amount_per_hour,
             (COALESCE(ts.hours,0) * COALESCE(pr.amount_per_hour,0)) AS amount
         FROM payee_rules pr
-        JOIN payees p  ON p.id  = pr.payee_id AND p.user_id = ?
-        JOIN contractors c ON c.id = pr.contractor_id AND c.user_id = ?
-        JOIN clients cl     ON cl.id = pr.client_id AND cl.user_id = ?
+        JOIN payees p  ON p.id  = pr.payee_id
+        JOIN contractors c ON c.id = pr.contractor_id
+        JOIN clients cl     ON cl.id = pr.client_id
         LEFT JOIN timesheets ts
           ON ts.contractor_id = pr.contractor_id
          AND ts.client_id     = pr.client_id
-         AND ts.user_id       = ?
          AND ts.year = ?
          AND ts.month = ?
         ORDER BY p.name, cl.name, c.name
     """
-    df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, user_id, year, month))
+    df = pd.read_sql_query(q, conn, params=(year, month))
     conn.close()
     return df
 
 
 def save_expense(client_id: int, year: int, month: int, category: str, description: str, amount: float):
     """Save an expense entry"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO expenses(user_id, client_id, year, month, category, description, amount, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO expenses(client_id, year, month, category, description, amount, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
-        (user_id, client_id, year, month, category.strip(), description.strip(), amount, datetime.utcnow().isoformat()),
+        (client_id, year, month, category.strip(), description.strip(), amount, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -689,9 +551,6 @@ def save_expense(client_id: int, year: int, month: int, category: str, descripti
 
 def fetch_expenses(year: int, month: int, client_id: int | None = None):
     """Fetch expenses for a given month and optionally filtered by client"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     if client_id:
         q = """
@@ -699,34 +558,31 @@ def fetch_expenses(year: int, month: int, client_id: int | None = None):
                    cl.name AS client_name
             FROM expenses e
             JOIN clients cl ON cl.id = e.client_id
-            WHERE e.user_id=? AND e.year=? AND e.month=? AND e.client_id=?
+            WHERE e.year=? AND e.month=? AND e.client_id=?
             ORDER BY e.category, e.description
         """
-        df = pd.read_sql_query(q, conn, params=(user_id, year, month, client_id))
+        df = pd.read_sql_query(q, conn, params=(year, month, client_id))
     else:
         q = """
             SELECT e.id, e.client_id, e.year, e.month, e.category, e.description, e.amount,
                    cl.name AS client_name
             FROM expenses e
             JOIN clients cl ON cl.id = e.client_id
-            WHERE e.user_id=? AND e.year=? AND e.month=?
+            WHERE e.year=? AND e.month=?
             ORDER BY cl.name, e.category, e.description
         """
-        df = pd.read_sql_query(q, conn, params=(user_id, year, month))
+        df = pd.read_sql_query(q, conn, params=(year, month))
     conn.close()
     return df
 
 
 def update_expense(expense_id: int, category: str, description: str, amount: float):
     """Update an expense entry"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
-        "UPDATE expenses SET category=?, description=?, amount=? WHERE id=? AND user_id=?",
-        (category.strip(), description.strip(), amount, expense_id, user_id),
+        "UPDATE expenses SET category=?, description=?, amount=? WHERE id=?",
+        (category.strip(), description.strip(), amount, expense_id),
     )
     conn.commit()
     conn.close()
@@ -734,32 +590,18 @@ def update_expense(expense_id: int, category: str, description: str, amount: flo
 
 def delete_expense(expense_id: int):
     """Delete an expense entry"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DELETE FROM expenses WHERE id=? AND user_id=?", (expense_id, user_id))
+    cur.execute("DELETE FROM expenses WHERE id=?", (expense_id,))
     conn.commit()
     conn.close()
 
 
 def get_company_info():
     """Get company information"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return {
-            "name": "Your Company Name",
-            "address": "",
-            "phone": "",
-            "email": "",
-            "bank_name": "",
-            "account_number": "",
-            "routing_number": ""
-        }
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT name, address, phone, email, bank_name, account_number, routing_number FROM company_info WHERE user_id = ?", (user_id,))
+    cur.execute("SELECT name, address, phone, email, bank_name, account_number, routing_number FROM company_info WHERE id = 1")
     row = cur.fetchone()
     conn.close()
     if row:
@@ -785,16 +627,13 @@ def get_company_info():
 
 def update_company_info(name: str, address: str, phone: str, email: str, bank_name: str = "", account_number: str = "", routing_number: str = ""):
     """Update company information"""
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO company_info (user_id, name, address, phone, email, bank_name, account_number, routing_number)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET
+        INSERT INTO company_info (id, name, address, phone, email, bank_name, account_number, routing_number)
+        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
         name=excluded.name,
         address=excluded.address,
         phone=excluded.phone,
@@ -803,7 +642,7 @@ def update_company_info(name: str, address: str, phone: str, email: str, bank_na
         account_number=excluded.account_number,
         routing_number=excluded.routing_number
         """,
-        (user_id, name.strip(), address.strip(), phone.strip(), email.strip(), bank_name.strip(), account_number.strip(), routing_number.strip()),
+        (name.strip(), address.strip(), phone.strip(), email.strip(), bank_name.strip(), account_number.strip(), routing_number.strip()),
     )
     conn.commit()
     conn.close()
@@ -859,76 +698,68 @@ def generate_payee_payouts_pdf(rows: list[dict], year: int, month: int) -> str:
 
 
 def resolve_rates(contractor_id: int, client_id: int):
-    user_id = get_current_user_id()
-    if not user_id:
-        return 0.0, 0.0
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
         SELECT
             COALESCE(a.bill_rate, c.default_bill_rate) AS bill_rate,
-            COALESCE(a.pay_rate, c.default_pay_rate) AS pay_rate
+            COALESCE(a.pay_rate, c.default_pay_rate) AS pay_rate,
+            c.billing_type
         FROM contractors c
         LEFT JOIN assignments a ON a.contractor_id = c.id AND a.client_id = ?
-        WHERE c.id = ? AND c.user_id = ?
+        WHERE c.id = ?
         """,
-        (client_id, contractor_id, user_id),
+        (client_id, contractor_id),
     )
     row = cur.fetchone()
     conn.close()
     if not row:
-        return 0.0, 0.0
-    return safe_float(row[0]), safe_float(row[1])
+        return 0.0, 0.0, "hourly"
+    return safe_float(row[0]), safe_float(row[1]), row[2]
 
 
 def save_timesheet(contractor_id: int, client_id: int, year: int, month: int, hours: float):
-    user_id = get_current_user_id()
-    if not user_id:
-        return
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO timesheets(user_id, contractor_id, client_id, year, month, hours, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, contractor_id, client_id, year, month) DO UPDATE SET
+        INSERT INTO timesheets(contractor_id, client_id, year, month, hours, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(contractor_id, client_id, year, month) DO UPDATE SET
         hours = excluded.hours,
         created_at = excluded.created_at
         """,
-        (user_id, contractor_id, client_id, year, month, hours, datetime.utcnow().isoformat()),
+        (contractor_id, client_id, year, month, hours, datetime.utcnow().isoformat()),
     )
     conn.commit()
     conn.close()
 
 
 def fetch_timesheets(year: int, month: int, client_id: int | None = None):
-    user_id = get_current_user_id()
-    if not user_id:
-        return pd.DataFrame()
     conn = get_conn()
     if client_id:
         q = """
             SELECT ts.id, ts.contractor_id, ts.client_id, ts.year, ts.month, ts.hours,
                    c.name AS contractor_name, cl.name AS client_name
             FROM timesheets ts
-            JOIN contractors c ON c.id = ts.contractor_id AND c.user_id = ?
-            JOIN clients cl ON cl.id = ts.client_id AND cl.user_id = ?
-            WHERE ts.user_id=? AND ts.year=? AND ts.month=? AND ts.client_id=?
+            JOIN contractors c ON c.id = ts.contractor_id
+            JOIN clients cl ON cl.id = ts.client_id
+            WHERE ts.year=? AND ts.month=? AND ts.client_id=?
             ORDER BY contractor_name
         """
-        df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, year, month, client_id))
+        df = pd.read_sql_query(q, conn, params=(year, month, client_id))
     else:
         q = """
             SELECT ts.id, ts.contractor_id, ts.client_id, ts.year, ts.month, ts.hours,
                    c.name AS contractor_name, cl.name AS client_name
             FROM timesheets ts
-            JOIN contractors c ON c.id = ts.contractor_id AND c.user_id = ?
-            JOIN clients cl ON cl.id = ts.client_id AND cl.user_id = ?
-            WHERE ts.user_id=? AND ts.year=? AND ts.month=?
+            JOIN contractors c ON c.id = ts.contractor_id
+            JOIN clients cl ON cl.id = ts.client_id
+            WHERE ts.year=? AND ts.month=?
             ORDER BY client_name, contractor_name
         """
-        df = pd.read_sql_query(q, conn, params=(user_id, user_id, user_id, year, month))
+        df = pd.read_sql_query(q, conn, params=(year, month))
     conn.close()
     return df
 
@@ -1044,9 +875,9 @@ def generate_invoice_pdf(client_row: pd.Series, items: list[dict], expenses: lis
     y = y_client
     c.setFont("Helvetica-Bold", 11)
     c.drawString(1 * inch, y, "Contractor")
-    c.drawString(2.8 * inch, y, "Hours")
-    c.drawString(3.6 * inch, y, "Rate")
-    c.drawString(4.6 * inch, y, "Line Total")
+    c.drawRightString(3.3 * inch, y, "Qty")
+    c.drawRightString(5.5 * inch, y, "Rate")
+    c.drawRightString(7.5 * inch, y, "Line Total")
     y -= 0.2 * inch
     c.line(1 * inch, y, 7.5 * inch, y)
 
@@ -1060,24 +891,33 @@ def generate_invoice_pdf(client_row: pd.Series, items: list[dict], expenses: lis
             c.showPage()
             c.setFont("Helvetica-Bold", 11)
             y = height - 1 * inch
-        line_total = safe_float(it["hours"]) * safe_float(it["bill_rate"])
+        # Calculate line total based on billing type
+        if it.get("billing_type") == "monthly":
+            line_total = safe_float(it["bill_rate"])
+            hours_display = "1"
+            rate_display = dollars(it["bill_rate"]) + " /month"
+        else:  # hourly
+            line_total = safe_float(it["hours"]) * safe_float(it["bill_rate"])
+            hours_display = f"{safe_float(it['hours']):.2f}"
+            rate_display = dollars(it["bill_rate"]) + " /hour"
+        
         total += line_total
         c.setFont("Helvetica", 10)
         c.drawString(1 * inch, y, str(it["contractor_name"]))
-        c.drawRightString(3.3 * inch, y, f"{safe_float(it['hours']):.2f}")
-        c.drawRightString(4.5 * inch, y, dollars(it["bill_rate"]))
+        c.drawRightString(3.3 * inch, y, hours_display)
+        c.drawRightString(5.5 * inch, y, rate_display)
         c.drawRightString(7.5 * inch, y, dollars(line_total))
         y -= 0.22 * inch
 
     # Add expenses section if there are any
     if expenses:
-        y -= 0.1 * inch
+        y -= 0.2 * inch  # Extra space to separate tables
         c.line(1 * inch, y, 7.5 * inch, y)
-        y -= 0.15 * inch
+        y -= 0.2 * inch  # Extra space after line
         
         c.setFont("Helvetica-Bold", 11)
         c.drawString(1 * inch, y, "Expenses")
-        c.drawString(4.6 * inch, y, "Amount")
+        c.drawRightString(7.5 * inch, y, "Amount")
         y -= 0.2 * inch
         c.line(1 * inch, y, 7.5 * inch, y)
         y -= 0.15 * inch
@@ -1115,17 +955,31 @@ def generate_invoice_pdf(client_row: pd.Series, items: list[dict], expenses: lis
     c.setFont("Helvetica", 10)
     y_remit -= 0.2 * inch
     
-    # Get company info for banking details
+    # Get company info and client bank
     company = get_company_info()
     
-    # Banking information (you can customize these)
-    banking_info = [
-        f"Bank: {company.get('bank_name', 'Your Bank Name')}",
-        f"Account #: {company.get('account_number', 'XXXX-XXXX-XXXX')}",
-        f"Routing #: {company.get('routing_number', 'XXXX-XXXX-X')}",
-        f"Payable to: {company['name']}",
-        f"Memo: Invoice {invoice_number}"
-    ]
+    # Get client's specific bank if assigned
+    bank_info = None
+    if 'bank_id' in client_row and client_row['bank_id'] is not None:
+        bank_info = get_bank_info(int(client_row['bank_id']))
+    
+    # Banking information - use client-specific bank if available, otherwise company default
+    if bank_info:
+        banking_info = [
+            f"Bank: {bank_info['bank_name']}",
+            f"Account #: {bank_info['account_number']}",
+            f"Routing #: {bank_info['routing_number']}",
+            f"Payable to: {company['name']}",
+            f"Memo: Invoice {invoice_number}"
+        ]
+    else:
+        banking_info = [
+            f"Bank: {company.get('bank_name', 'Your Bank Name')}",
+            f"Account #: {company.get('account_number', 'XXXX-XXXX-XXXX')}",
+            f"Routing #: {company.get('routing_number', 'XXXX-XXXX-X')}",
+            f"Payable to: {company['name']}",
+            f"Memo: Invoice {invoice_number}"
+        ]
     
     for line in banking_info:
         c.drawString(1 * inch, y_remit, line)
@@ -1214,14 +1068,14 @@ def month_selector(prefix: str = "ms"):
 
 def setup_tab():
     st.subheader("Setup")
-    st.caption("Configure your company info, manage contractors, clients, and payees.")
+    st.caption("Configure your company info, manage contractors, clients, banks, and payees.")
     
     # Sidebar navigation
     with st.sidebar:
         st.markdown("### Navigation")
         page = st.radio(
             "Select Management Area:",
-            ["Company", "Contractors", "Clients", "Payees"],
+            ["Company", "Contractors", "Clients", "Banks", "Payees"],
             key="setup_nav"
         )
     
@@ -1232,6 +1086,8 @@ def setup_tab():
         contractors_page()
     elif page == "Clients":
         clients_page()
+    elif page == "Banks":
+        banks_page()
     elif page == "Payees":
         payees_page()
 
@@ -1266,16 +1122,18 @@ def contractors_page():
     
     # Add new contractor
     st.markdown("#### Add New Contractor")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     with col1:
         name = st.text_input("Contractor name", key="su_contractor_name")
     with col2:
-        bill = st.number_input("Default bill rate", min_value=0.0, value=80.0, step=1.0, key="su_bill_rate")
+        billing_type = st.selectbox("Billing Type", ["hourly", "monthly"], key="su_billing_type")
     with col3:
+        bill = st.number_input("Default bill rate", min_value=0.0, value=80.0, step=1.0, key="su_bill_rate")
+    with col4:
         pay = st.number_input("Default pay rate", min_value=0.0, value=70.0, step=1.0, key="su_pay_rate")
     
     if st.button("Add Contractor", key="su_save_contractor") and name.strip():
-        upsert_contractor(name, bill, pay)
+        upsert_contractor(name, bill, pay, billing_type)
         st.success("Contractor added")
         list_contractors.clear()
     
@@ -1294,12 +1152,15 @@ def contractors_page():
             sel_id = int(sel_row["id"])
         with colB:
             new_name = st.text_input("Name", value=sel_row["name"], key="ed_contractor_name")
+            new_billing_type = st.selectbox("Billing Type", ["hourly", "monthly"], 
+                                           index=0 if sel_row.get("billing_type", "hourly") == "hourly" else 1,
+                                           key="ed_contractor_billing_type")
             new_bill = st.number_input("Default bill rate", min_value=0.0, value=float(sel_row["bill_rate"]), step=1.0, key="ed_contractor_bill")
             new_pay = st.number_input("Default pay rate", min_value=0.0, value=float(sel_row["pay_rate"]), step=1.0, key="ed_contractor_pay")
             colU, colD = st.columns([1, 1])
             with colU:
                 if st.button("Update Contractor", key="ed_contractor_update"):
-                    update_contractor(sel_id, new_name, new_bill, new_pay)
+                    update_contractor(sel_id, new_name, new_bill, new_pay, new_billing_type)
                     st.success("Contractor updated")
                     list_contractors.clear()
             with colD:
@@ -1318,15 +1179,23 @@ def clients_page():
     
     # Add new client
     st.markdown("#### Add New Client")
+    banks = list_banks()
     col1, col2 = st.columns(2)
     with col1:
         cname = st.text_input("Client name", key="su_client_name")
         caddr = st.text_area("Client address", height=100, key="su_client_addr")
     with col2:
         cemail = st.text_input("Client email", key="su_client_email")
+        if not banks.empty:
+            bank_options = ["None"] + banks["name"].tolist()
+            selected_bank = st.selectbox("Remit To Bank (optional)", bank_options, key="su_client_bank")
+            bank_id = None if selected_bank == "None" else int(banks.loc[banks.name == selected_bank, "id"].iloc[0])
+        else:
+            bank_id = None
+            st.info("Add banks in Setup > Banks to assign a remit-to bank")
     
     if st.button("Add Client", key="su_save_client") and cname.strip():
-        upsert_client(cname, caddr, cemail)
+        upsert_client(cname, caddr, cemail, bank_id)
         st.success("Client added")
         list_clients.clear()
     
@@ -1347,10 +1216,23 @@ def clients_page():
             new_cname = st.text_input("Name", value=sel_row["name"], key="ed_client_name")
             new_caddr = st.text_area("Address", value=str(sel_row.get("address", "")), key="ed_client_addr")
             new_cemail = st.text_input("Email", value=str(sel_row.get("email", "")), key="ed_client_email")
+            banks = list_banks()
+            if not banks.empty:
+                bank_options = ["None"] + banks["name"].tolist()
+                current_bank_id = sel_row.get("bank_id")
+                if pd.notna(current_bank_id) and current_bank_id is not None:
+                    current_bank = banks.loc[banks.id == int(current_bank_id), "name"].iloc[0] if not banks.loc[banks.id == int(current_bank_id)].empty else "None"
+                else:
+                    current_bank = "None"
+                selected_bank = st.selectbox("Remit To Bank (optional)", bank_options, 
+                                            index=bank_options.index(current_bank), key="ed_client_bank")
+                new_bank_id = None if selected_bank == "None" else int(banks.loc[banks.name == selected_bank, "id"].iloc[0])
+            else:
+                new_bank_id = None
             colU2, colD2 = st.columns([1, 1])
             with colU2:
                 if st.button("Update Client", key="ed_client_update"):
-                    update_client(sel_id, new_cname, new_caddr, new_cemail)
+                    update_client(sel_id, new_cname, new_caddr, new_cemail, new_bank_id)
                     st.success("Client updated")
                     list_clients.clear()
             with colD2:
@@ -1398,6 +1280,63 @@ def clients_page():
             conn.commit()
             conn.close()
             st.success("Override saved")
+
+
+def banks_page():
+    """Bank management page"""
+    st.markdown("### Bank Management")
+    
+    # Add new bank
+    st.markdown("#### Add New Bank")
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        bank_name_display = st.text_input("Display Name", key="bank_display_name", placeholder="e.g., Huntington")
+    with col2:
+        bank_inst_name = st.text_input("Institution Name", key="bank_inst_name", placeholder="Huntington Bank")
+    with col3:
+        bank_account = st.text_input("Account #", key="bank_account", placeholder="XXXX-XXXX-XXXX")
+    with col4:
+        bank_routing = st.text_input("Routing #", key="bank_routing", placeholder="XXXX-XXXX-X")
+    with col5:
+        st.write("")  # Spacer
+        st.write("")  # Spacer
+        if st.button("Add Bank", key="bank_save") and bank_name_display.strip():
+            upsert_bank(bank_name_display, bank_inst_name, bank_account, bank_routing)
+            st.success("Bank added")
+            list_banks.clear()
+    
+    st.divider()
+    
+    # Edit/Delete banks
+    st.markdown("#### Edit/Delete Banks")
+    banks = list_banks()
+    if banks.empty:
+        st.info("No banks yet.")
+    else:
+        colA, colB = st.columns([2, 3])
+        with colA:
+            sel_bank_name = st.selectbox("Select bank", banks["name"].tolist(), key="ed_bank_select")
+            sel_row = banks.loc[banks.name == sel_bank_name].iloc[0]
+            sel_id = int(sel_row["id"])
+        with colB:
+            new_display_name = st.text_input("Display Name", value=sel_row["name"], key="ed_bank_display")
+            new_inst_name = st.text_input("Institution Name", value=sel_row["bank_name"], key="ed_bank_inst")
+            new_account = st.text_input("Account #", value=sel_row["account_number"], key="ed_bank_account")
+            new_routing = st.text_input("Routing #", value=sel_row["routing_number"], key="ed_bank_routing")
+            colU, colD = st.columns([1, 1])
+            with colU:
+                if st.button("Update Bank", key="ed_bank_update"):
+                    update_bank(sel_id, new_display_name, new_inst_name, new_account, new_routing)
+                    st.success("Bank updated")
+                    list_banks.clear()
+            with colD:
+                if st.button("Delete Bank", key="ed_bank_delete"):
+                    delete_bank(sel_id)
+                    st.success("Bank deleted")
+                    list_banks.clear()
+        
+        st.markdown("**All Banks:**")
+        st.dataframe(banks, use_container_width=True)
 
 
 def payees_page():
@@ -1531,10 +1470,16 @@ def entry_tab():
     sel_cid = int(contractors.loc[contractors.name == c_name, "id"].iloc[0])
     sel_clid = int(clients.loc[clients.name == cl_name, "id"].iloc[0])
 
-    bill_rate, pay_rate = resolve_rates(sel_cid, sel_clid)
-    st.caption(f"Bill rate: {dollars(bill_rate)} | Pay rate: {dollars(pay_rate)}")
+    bill_rate, pay_rate, billing_type = resolve_rates(sel_cid, sel_clid)
+    billing_label = "per hour" if billing_type == "hourly" else "per month"
+    st.caption(f"Bill rate: {dollars(bill_rate)} {billing_label} | Pay rate: {dollars(pay_rate)}")
 
-    hrs = st.number_input("Hours", min_value=0.0, value=0.0, step=0.25, key="en_hours")
+    # For monthly billing, hours are not used for billing but still stored for payroll
+    if billing_type == "monthly":
+        hrs = st.number_input("Hours (for payroll tracking only)", min_value=0.0, value=0.0, step=0.25, key="en_hours",
+                              help="Hours are only used for payroll calculation, not billing")
+    else:
+        hrs = st.number_input("Hours", min_value=0.0, value=0.0, step=0.25, key="en_hours")
 
     if st.button("Save hours", key="en_save_hours"):
         save_timesheet(sel_cid, sel_clid, year, month, hrs)
@@ -1643,12 +1588,13 @@ def invoice_tab():
 
     items = []
     for _, row in ts.iterrows():
-        br, pr = resolve_rates(int(row["contractor_id"]), int(row["client_id"]))
+        br, pr, bt = resolve_rates(int(row["contractor_id"]), int(row["client_id"]))
         items.append({
             "contractor_name": row["contractor_name"],
             "hours": safe_float(row["hours"]),
             "bill_rate": br,
             "pay_rate": pr,
+            "billing_type": bt,
         })
 
     # Prepare expense data
@@ -1665,12 +1611,20 @@ def invoice_tab():
     
     # Add contractor items
     for it in items:
+        # Calculate amount based on billing type
+        if it["billing_type"] == "hourly":
+            amount = it["hours"] * safe_float(it["bill_rate"])
+            hours_qty = f"{it['hours']:.2f}"
+        else:  # monthly
+            amount = safe_float(it["bill_rate"])
+            hours_qty = "1"
+        
         preview_data.append({
             "Type": "Labor",
             "Description": it["contractor_name"],
-            "Hours/Qty": f"{it['hours']:.2f}",
+            "Hours/Qty": hours_qty,
             "Rate": dollars(it["bill_rate"]),
-            "Amount": dollars(it["hours"] * safe_float(it["bill_rate"]))
+            "Amount": dollars(amount)
         })
     
     # Add expense items
@@ -1719,23 +1673,28 @@ def invoice_tab():
             # Save to invoice registry
             conn = get_conn()
             cur = conn.cursor()
-            labor_total = sum([safe_float(it["hours"]) * safe_float(it["bill_rate"]) for it in items])
+            # Calculate labor total based on billing type
+            labor_total = 0.0
+            for it in items:
+                if it["billing_type"] == "hourly":
+                    labor_total += safe_float(it["hours"]) * safe_float(it["bill_rate"])
+                else:  # monthly
+                    labor_total += safe_float(it["bill_rate"])
+            
             expense_total = sum([safe_float(exp["amount"]) for exp in expense_items])
             total_amount = labor_total + expense_total
             
-            user_id = get_current_user_id()
-            if user_id:
-                cur.execute(
-                    """
-                    INSERT INTO invoices(user_id, client_id, year, month, total_amount, pdf_path, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(user_id, client_id, year, month) DO UPDATE SET
-                    total_amount=excluded.total_amount,
-                    pdf_path=excluded.pdf_path,
-                    created_at=excluded.created_at
-                    """,
-                    (user_id, int(client_row["id"]), year, month, float(total_amount), path, datetime.utcnow().isoformat()),
-                )
+            cur.execute(
+                """
+                INSERT INTO invoices(client_id, year, month, total_amount, pdf_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(client_id, year, month) DO UPDATE SET
+                total_amount=excluded.total_amount,
+                pdf_path=excluded.pdf_path,
+                created_at=excluded.created_at
+                """,
+                (int(client_row["id"]), year, month, float(total_amount), path, datetime.utcnow().isoformat()),
+            )
             conn.commit()
             conn.close()
 
@@ -1758,14 +1717,21 @@ def reports_tab():
         # Process timesheet data
         rows = []
         for _, r in df.iterrows():
-            br, pr = resolve_rates(int(r["contractor_id"]), int(r["client_id"]))
+            br, pr, bt = resolve_rates(int(r["contractor_id"]), int(r["client_id"]))
+            # Calculate revenue based on billing type
+            if bt == "hourly":
+                revenue = safe_float(r["hours"]) * safe_float(br)
+            else:  # monthly
+                revenue = safe_float(br)  # monthly rate, ignore hours
+            
             rows.append({
                 "client_name": r["client_name"],
                 "contractor_name": r["contractor_name"],
                 "hours": safe_float(r["hours"]),
                 "bill_rate": br,
                 "pay_rate": pr,
-                "revenue": safe_float(r["hours"]) * safe_float(br),
+                "billing_type": bt,
+                "revenue": revenue,
                 "payroll": safe_float(r["hours"]) * safe_float(pr),
             })
 
@@ -1926,21 +1892,8 @@ def seed_example():
 
 def main():
     st.set_page_config(page_title="Solo Invoicing", layout="wide")
-    init_db()
-    
-    # Check authentication
-    if not is_authenticated():
-        show_auth_page()
-        return
-    
-    # User is authenticated - show main app
     st.title("Solo Invoicing and Payments")
-    username = st.session_state.get('username', 'User')
-    st.sidebar.markdown(f"**Logged in as:** {username}")
-    
-    if st.sidebar.button("Logout", key="logout_btn"):
-        logout_user()
-        st.rerun()
+    init_db()
 
     with st.sidebar:
         st.markdown("**Quick actions**")
@@ -1949,7 +1902,7 @@ def main():
             st.success("Sample data loaded for Sept 2025 (includes contractors, clients, hours, and expenses)")
             list_contractors.clear()
             list_clients.clear()
-        st.caption("Data is stored on the server. PDFs are saved to the invoices, payables, and payees folders.")
+        st.caption("Data is stored locally in data.db. PDFs are saved to the invoices, payables, and payees folders.")
 
     tabs = st.tabs(["Setup", "Enter Hours & Expenses", "Generate Invoice", "Reports"])
     with tabs[0]:
