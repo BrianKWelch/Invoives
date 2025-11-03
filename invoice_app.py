@@ -125,6 +125,58 @@ def dollars(x: Optional[float]) -> str:
 # Database helpers
 # -----------------------------
 
+def migrate_data_from_old_db(username: str):
+    """Migrate data from old data.db to user-specific database if it exists"""
+    old_db = DB_PATH
+    new_db = get_db_path()
+    
+    # Check if old database exists and new database doesn't exist yet
+    if not os.path.exists(old_db) or os.path.exists(new_db):
+        return False
+    
+    try:
+        # Copy database file
+        import shutil
+        shutil.copy2(old_db, new_db)
+        
+        # Mark migration as complete in session state
+        st.session_state[f'migrated_{username}'] = True
+        return True
+    except Exception as e:
+        st.error(f"Error during migration: {str(e)}")
+        return False
+
+def check_and_migrate_data():
+    """Check if user needs data migration from old database"""
+    if not check_authentication() or 'username' not in st.session_state:
+        return
+    
+    username = st.session_state.username
+    migration_key = f'migrated_{username}'
+    migration_prompt_key = f'migration_prompted_{username}'
+    
+    # Check if already migrated
+    if st.session_state.get(migration_key, False):
+        return
+    
+    # Check if old data.db exists and hasn't been migrated by anyone
+    if os.path.exists(DB_PATH):
+        user_db = get_db_path()
+        # Only prompt if user's database doesn't exist yet
+        if not os.path.exists(user_db):
+            # Show migration prompt if not already shown
+            if not st.session_state.get(migration_prompt_key, False):
+                st.session_state[migration_prompt_key] = True
+                return "prompt"  # Signal that migration should be prompted
+            elif st.session_state.get('migrate_now', False):
+                # User clicked migrate button
+                if migrate_data_from_old_db(username):
+                    st.session_state[migration_key] = True
+                    st.session_state.migrate_now = False
+                    st.session_state.show_migration_success = True
+                    st.rerun()
+    return None
+
 def get_conn():
     # Use user-specific database path if authenticated
     if check_authentication() and 'username' in st.session_state:
@@ -1976,10 +2028,31 @@ def main():
     # User is authenticated, show the app
     st.set_page_config(page_title="Solo Invoicing", layout="wide")
     
+    # Check for data migration opportunity
+    migration_status = check_and_migrate_data()
+    
     # Add logout button in sidebar
     with st.sidebar:
         if st.session_state.get("username"):
             st.markdown(f"**Logged in as:** {st.session_state.username}")
+        
+        # Show migration prompt if old data exists
+        if migration_status == "prompt":
+            st.info("⚠️ **Data Migration Available**")
+            st.write("We found existing data from before authentication was added.")
+            st.write("Would you like to migrate it to your account?")
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("✅ Yes, Migrate", key="migrate_yes"):
+                    st.session_state.migrate_now = True
+                    st.rerun()
+            with col2:
+                if st.button("❌ Skip", key="migrate_no"):
+                    st.session_state[f'migrated_{st.session_state.username}'] = True
+                    st.session_state[f'migration_prompted_{st.session_state.username}'] = True
+                    st.rerun()
+            st.markdown("---")
+        
         if st.button("🚪 Logout", key="logout_btn"):
             st.session_state.authenticated = False
             st.session_state.username = None
@@ -1987,6 +2060,12 @@ def main():
         st.markdown("---")
     
     st.title("Solo Invoicing and Payments")
+    
+    # Show migration success message if just migrated
+    if st.session_state.get('show_migration_success', False):
+        st.success("✅ Your existing data has been migrated to your account!")
+        st.session_state.show_migration_success = False
+    
     init_db()
 
     with st.sidebar:
@@ -1996,7 +2075,8 @@ def main():
             st.success("Sample data loaded for Sept 2025 (includes contractors, clients, hours, and expenses)")
             list_contractors.clear()
             list_clients.clear()
-        st.caption("Data is stored locally in data.db. PDFs are saved to the invoices, payables, and payees folders.")
+        user_db = get_db_path() if check_authentication() else DB_PATH
+        st.caption(f"Data is stored in {user_db}. PDFs are saved to the invoices, payables, and payees folders.")
 
     tabs = st.tabs(["Setup", "Enter Hours & Expenses", "Generate Invoice", "Reports"])
     with tabs[0]:
