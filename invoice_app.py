@@ -13,6 +13,7 @@ import base64
 import calendar
 from datetime import datetime
 from typing import Optional
+import hashlib
 
 import pandas as pd
 import streamlit as st
@@ -20,7 +21,17 @@ from reportlab.lib.pagesizes import LETTER
 from reportlab.lib.units import inch
 from reportlab.pdfgen import canvas
 
-DB_PATH = "data.db"
+DB_PATH = "data.db"  # Fallback for compatibility
+
+# Database path - will be user-specific when authenticated
+def get_db_path():
+    """Get database path for current user"""
+    try:
+        username = st.session_state.get("username", "default")
+        # Use user-specific database to prevent data sharing
+        return f"data_{username}.db"
+    except Exception:
+        return DB_PATH
 INVOICE_DIR = "invoices"
 PAYABLES_DIR = "payables"
 PAYEES_DIR = "payees"
@@ -28,6 +39,67 @@ PAYEES_DIR = "payees"
 os.makedirs(INVOICE_DIR, exist_ok=True)
 os.makedirs(PAYABLES_DIR, exist_ok=True)
 os.makedirs(PAYEES_DIR, exist_ok=True)
+
+# -----------------------------
+# Authentication
+# -----------------------------
+
+def hash_password(password: str) -> str:
+    """Hash a password using SHA256"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def check_authentication():
+    """Check if user is authenticated"""
+    if 'authenticated' not in st.session_state:
+        st.session_state.authenticated = False
+    return st.session_state.authenticated
+
+def authenticate_user(username: str, password: str) -> bool:
+    """Authenticate user against secrets"""
+    try:
+        # Get credentials from Streamlit secrets
+        # Structure: secrets["users"][username] = password_hash
+        if "users" in st.secrets:
+            users = st.secrets["users"]
+            if username in users:
+                stored_hash = users[username]
+                password_hash = hash_password(password)
+                if password_hash == stored_hash:
+                    st.session_state.authenticated = True
+                    st.session_state.username = username
+                    return True
+        return False
+    except Exception:
+        # If secrets not configured, allow a default for development
+        # IMPORTANT: Set proper secrets in production!
+        default_user = os.getenv("DEFAULT_USER", "admin")
+        default_pass = os.getenv("DEFAULT_PASS", "")
+        if username == default_user and password == default_pass and default_pass:
+            st.session_state.authenticated = True
+            st.session_state.username = username
+            return True
+        return False
+
+def show_login_page():
+    """Display login page"""
+    st.set_page_config(page_title="Solo Invoicing - Login", layout="centered")
+    st.title("🔐 Solo Invoicing Login")
+    st.markdown("---")
+    
+    with st.form("login_form"):
+        username = st.text_input("Username", key="login_username")
+        password = st.text_input("Password", type="password", key="login_password")
+        submit = st.form_submit_button("Login")
+        
+        if submit:
+            if authenticate_user(username, password):
+                st.success("Login successful!")
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+    
+    st.markdown("---")
+    st.caption("Please enter your credentials to access the invoicing system.")
 
 # -----------------------------
 # Utilities
@@ -54,7 +126,12 @@ def dollars(x: Optional[float]) -> str:
 # -----------------------------
 
 def get_conn():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    # Use user-specific database path if authenticated
+    if check_authentication() and 'username' in st.session_state:
+        db_path = get_db_path()
+    else:
+        db_path = DB_PATH
+    return sqlite3.connect(db_path, check_same_thread=False)
 
 
 def init_db():
@@ -1891,7 +1968,24 @@ def seed_example():
 # -----------------------------
 
 def main():
+    # Check authentication first
+    if not check_authentication():
+        show_login_page()
+        return
+    
+    # User is authenticated, show the app
     st.set_page_config(page_title="Solo Invoicing", layout="wide")
+    
+    # Add logout button in sidebar
+    with st.sidebar:
+        if st.session_state.get("username"):
+            st.markdown(f"**Logged in as:** {st.session_state.username}")
+        if st.button("🚪 Logout", key="logout_btn"):
+            st.session_state.authenticated = False
+            st.session_state.username = None
+            st.rerun()
+        st.markdown("---")
+    
     st.title("Solo Invoicing and Payments")
     init_db()
 
