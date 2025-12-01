@@ -65,13 +65,52 @@ def register_user(username: str, password: str) -> tuple[bool, str]:
     username = username.strip().lower()
     password_hash = hash_password(password)
     
+    conn = None
     try:
-        conn = get_conn()
+        # Ensure database is initialized before registration
+        # Use shared database (DB_PATH) for user registration
+        # Use absolute path for better compatibility on Streamlit Cloud
+        db_path = os.path.abspath(DB_PATH)
+        
+        # Ensure the directory exists (for Streamlit Cloud compatibility)
+        db_dir = os.path.dirname(db_path) if os.path.dirname(db_path) else "."
+        if db_dir and db_dir != "." and not os.path.exists(db_dir):
+            try:
+                os.makedirs(db_dir, exist_ok=True)
+            except Exception:
+                pass  # Directory creation failed, but might still work
+        
+        # Connect with explicit timeout and WAL mode disabled for better compatibility
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
+        # Disable WAL mode for better compatibility on Streamlit Cloud
+        conn.execute("PRAGMA journal_mode=DELETE")
         cur = conn.cursor()
+        
+        # Ensure users table exists
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        
+        # Verify table was created by checking if it exists
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='users'")
+        if not cur.fetchone():
+            if conn:
+                conn.close()
+            return False, "Failed to create users table. Please contact support."
+        
         # Check if username already exists
         cur.execute("SELECT id FROM users WHERE username = ?", (username,))
         if cur.fetchone():
-            conn.close()
+            if conn:
+                conn.close()
             return False, "Username already exists. Please choose a different one."
         
         # Insert new user
@@ -80,11 +119,51 @@ def register_user(username: str, password: str) -> tuple[bool, str]:
             (username, password_hash, datetime.utcnow().isoformat())
         )
         conn.commit()
-        conn.close()
+        
+        # Verify the insert worked
+        cur.execute("SELECT id FROM users WHERE username = ?", (username,))
+        if not cur.fetchone():
+            if conn:
+                conn.close()
+            return False, "Failed to create user account. Please try again."
+        
+        if conn:
+            conn.close()
         return True, "Registration successful! You can now login."
+    except sqlite3.OperationalError as e:
+        error_msg = str(e)
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        # Provide more helpful error messages
+        if "no such table" in error_msg.lower():
+            return False, f"Database error: Table not found. The database may not be initialized. Error: {error_msg}"
+        elif "readonly" in error_msg.lower() or "permission" in error_msg.lower():
+            return False, f"Database error: Cannot write to database. This may be a permissions issue on Streamlit Cloud. Error: {error_msg}"
+        elif "locked" in error_msg.lower():
+            return False, f"Database error: Database is locked. Please try again in a moment. Error: {error_msg}"
+        else:
+            return False, f"Database error: {error_msg}"
     except sqlite3.Error as e:
-        return False, f"Registration error: {str(e)}"
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        return False, f"Database error: {str(e)}"
     except Exception as e:
+        if conn:
+            try:
+                conn.close()
+            except:
+                pass
+        import traceback
+        error_trace = traceback.format_exc()
+        # Only show full traceback in development, simplified for production
+        if "streamlit" in str(e).lower() or "cloud" in str(e).lower():
+            return False, f"Error during registration: {str(e)}"
         return False, f"Unexpected error: {str(e)}"
 
 def authenticate_user(username: str, password: str) -> bool:
@@ -110,8 +189,27 @@ def authenticate_user(username: str, password: str) -> bool:
     
     # Second, check database (for self-registered users)
     try:
-        conn = get_conn()
+        # Use shared database (DB_PATH) for authentication check
+        # Use absolute path for better compatibility on Streamlit Cloud
+        db_path = os.path.abspath(DB_PATH)
+        conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
+        # Disable WAL mode for better compatibility on Streamlit Cloud
+        conn.execute("PRAGMA journal_mode=DELETE")
         cur = conn.cursor()
+        
+        # Ensure users table exists
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+        
         cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
         result = cur.fetchone()
         conn.close()
@@ -139,6 +237,9 @@ def authenticate_user(username: str, password: str) -> bool:
 def show_login_page():
     """Display login page with registration option"""
     st.set_page_config(page_title="Solo Invoicing - Login", layout="centered")
+    
+    # Initialize database to ensure users table exists for registration
+    init_db()
     
     # Create tabs for Login and Register
     tab1, tab2 = st.tabs(["🔐 Login", "📝 Register"])
@@ -187,7 +288,10 @@ def show_login_page():
                         st.success(message)
                         st.info("🔄 Switch to the Login tab to sign in.")
                     else:
-                        st.error(message)
+                        st.error(f"❌ {message}")
+                        # Show additional debug info in development
+                        if os.getenv("STREAMLIT_DEBUG", "").lower() == "true":
+                            st.code(f"Debug: DB_PATH={DB_PATH}, File exists: {os.path.exists(DB_PATH) if DB_PATH else 'N/A'}")
         
         st.markdown("---")
         st.caption("Already have an account? Go to the Login tab above.")
