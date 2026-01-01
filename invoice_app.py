@@ -187,9 +187,8 @@ def authenticate_user(username: str, password: str) -> bool:
 
     # 1) Streamlit secrets users
     try:
-        if "users" in st.secrets:
-            users = st.secrets["users"]
-            if username in users:
+        users = st.secrets.get("users", None)
+            if users and username in users:
                 stored_hash = users[username]
                 if password_hash == stored_hash:
                     post_login()
@@ -223,7 +222,11 @@ def authenticate_user(username: str, password: str) -> bool:
         if row and row[0] == password_hash:
             post_login()
             return True
-    
+    except Exception:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
     # 3) Dev fallback (env vars)
     try:
@@ -237,8 +240,7 @@ def authenticate_user(username: str, password: str) -> bool:
 
     return False
 
-except Exception:
-    pass
+
 
     
     
