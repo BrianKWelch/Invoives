@@ -225,6 +225,7 @@ def authenticate_user(username: str, password: str) -> bool:
             return True
     except Exception:
         pass
+        
     finally:
         try:
             if conn:
