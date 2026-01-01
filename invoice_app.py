@@ -183,9 +183,13 @@ def authenticate_user(username: str, password: str) -> bool:
                 if password_hash == stored_hash:
                     st.session_state.authenticated = True
                     st.session_state.username = username
-                    return True
-    except Exception:
-        pass  # Secrets not configured, continue to database check
+                    try:
+                        list_contractors.clear()
+                        list_clients.clear()
+                        list_payees.clear()
+                        list_banks.clear()
+                    except Exception:
+                        pass  # Secrets not configured, continue to database check
     
     # Second, check database (for self-registered users)
     try:
@@ -217,9 +221,14 @@ def authenticate_user(username: str, password: str) -> bool:
         if result and result[0] == password_hash:
             st.session_state.authenticated = True
             st.session_state.username = username
-            return True
-    except Exception:
-        pass  # Database error, authentication fails
+            try:
+                list_contractors.clear()
+                list_clients.clear()
+                list_payees.clear()
+                list_banks.clear()
+            except Exception:
+                pass  # Database error, authentication fails
+
     
     # Fallback for development (only if no other auth configured)
     try:
@@ -228,9 +237,13 @@ def authenticate_user(username: str, password: str) -> bool:
         if username == default_user and password == default_pass and default_pass:
             st.session_state.authenticated = True
             st.session_state.username = username
-            return True
-    except Exception:
-        pass
+            try:
+                list_contractors.clear()
+                list_clients.clear()
+                list_payees.clear()
+                list_banks.clear()
+            except Exception:
+                pass
     
     return False
 
