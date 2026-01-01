@@ -27,12 +27,12 @@ DB_PATH = "data.db"  # Fallback for compatibility
 # Database path - will be user-specific when authenticated
 def get_db_path():
     """Get database path for current user"""
-    try:
-        username = st.session_state.get("username", "default")
+    username = st.session_state.get("username", "default")
         # Use user-specific database to prevent data sharing
-        return f"data_{username}.db"
-    except Exception:
+    if username in ["brianwelch", "default"]:
         return DB_PATH
+    return f"data_{username}.db"
+            
 INVOICE_DIR = "invoices"
 PAYABLES_DIR = "payables"
 PAYEES_DIR = "payees"
