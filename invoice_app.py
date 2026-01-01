@@ -175,6 +175,7 @@ def authenticate_user(username: str, password: str) -> bool:
     password_hash = hash_password(password)
     
     # First, check Streamlit secrets (for admin/pre-configured users)
+       # First, check Streamlit secrets (for admin/pre-configured users)
     try:
         if "users" in st.secrets:
             users = st.secrets["users"]
@@ -183,13 +184,20 @@ def authenticate_user(username: str, password: str) -> bool:
                 if password_hash == stored_hash:
                     st.session_state.authenticated = True
                     st.session_state.username = username
+
+                    # Clear cached lists after login (safe)
                     try:
                         list_contractors.clear()
                         list_clients.clear()
                         list_payees.clear()
                         list_banks.clear()
                     except Exception:
-                        pass  # Secrets not configured, continue to database check
+                        pass
+
+                    return True
+    except Exception:
+        pass  # Secrets not configured, continue to database check
+
     
     # Second, check database (for self-registered users)
     try:
