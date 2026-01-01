@@ -260,7 +260,7 @@ except Exception:
     pass
 
     
-    return False
+    
 
 def show_login_page():
     """Display login page with registration option"""
