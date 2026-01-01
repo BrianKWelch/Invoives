@@ -170,46 +170,40 @@ def authenticate_user(username: str, password: str) -> bool:
     """Authenticate user against secrets and database"""
     if not username or not password:
         return False
-    
+
     username = username.strip().lower()
     password_hash = hash_password(password)
-    
-    # First, check Streamlit secrets (for admin/pre-configured users)
-       # First, check Streamlit secrets (for admin/pre-configured users)
+
+    def post_login():
+        st.session_state.authenticated = True
+        st.session_state.username = username
+        try:
+            list_contractors.clear()
+            list_clients.clear()
+            list_payees.clear()
+            list_banks.clear()
+        except Exception:
+            pass
+
+    # 1) Streamlit secrets users
     try:
         if "users" in st.secrets:
             users = st.secrets["users"]
             if username in users:
                 stored_hash = users[username]
                 if password_hash == stored_hash:
-                    st.session_state.authenticated = True
-                    st.session_state.username = username
-
-                    # Clear cached lists after login (safe)
-                    try:
-                        list_contractors.clear()
-                        list_clients.clear()
-                        list_payees.clear()
-                        list_banks.clear()
-                    except Exception:
-                        pass
-
+                    post_login()
                     return True
     except Exception:
-        pass  # Secrets not configured, continue to database check
+        pass
 
-    
-    # Second, check database (for self-registered users)
+    # 2) Self-registered users in shared DB_PATH
     try:
-        # Use shared database (DB_PATH) for authentication check
-        # Use absolute path for better compatibility on Streamlit Cloud
         db_path = os.path.abspath(DB_PATH)
         conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
-        # Disable WAL mode for better compatibility on Streamlit Cloud
         conn.execute("PRAGMA journal_mode=DELETE")
         cur = conn.cursor()
-        
-        # Ensure users table exists
+
         cur.execute(
             """
             CREATE TABLE IF NOT EXISTS users (
@@ -221,41 +215,29 @@ def authenticate_user(username: str, password: str) -> bool:
             """
         )
         conn.commit()
-        
+
         cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
-        result = cur.fetchone()
+        row = cur.fetchone()
         conn.close()
-        
-        if result and result[0] == password_hash:
-            st.session_state.authenticated = True
-            st.session_state.username = username
-            try:
-                list_contractors.clear()
-                list_clients.clear()
-                list_payees.clear()
-                list_banks.clear()
-            except Exception:
-                pass  # Database error, authentication fails
 
-    
-    # Fallback for development (only if no other auth configured)
-try:
-    default_user = os.getenv("DEFAULT_USER", "")
-    default_pass = os.getenv("DEFAULT_PASS", "")
-    if username == default_user and password == default_pass and default_pass:
-        st.session_state.authenticated = True
-        st.session_state.username = username
+        if row and row[0] == password_hash:
+            post_login()
+            return True
+    except Exception:
+        pass
 
-        # Clear cached lists after login (safe)
-        try:
-            list_contractors.clear()
-            list_clients.clear()
-            list_payees.clear()
-            list_banks.clear()
-        except Exception:
-            pass
+    # 3) Dev fallback (env vars)
+    try:
+        default_user = os.getenv("DEFAULT_USER", "")
+        default_pass = os.getenv("DEFAULT_PASS", "")
+        if username == default_user and password == default_pass and default_pass:
+            post_login()
+            return True
+    except Exception:
+        pass
 
-        return True
+    return False
+
 except Exception:
     pass
 
