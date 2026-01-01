@@ -239,19 +239,26 @@ def authenticate_user(username: str, password: str) -> bool:
 
     
     # Fallback for development (only if no other auth configured)
-    try:
-        default_user = os.getenv("DEFAULT_USER", "")
-        default_pass = os.getenv("DEFAULT_PASS", "")
-        if username == default_user and password == default_pass and default_pass:
-            st.session_state.authenticated = True
-            st.session_state.username = username
-            try:
-                list_contractors.clear()
-                list_clients.clear()
-                list_payees.clear()
-                list_banks.clear()
-            except Exception:
-                pass
+try:
+    default_user = os.getenv("DEFAULT_USER", "")
+    default_pass = os.getenv("DEFAULT_PASS", "")
+    if username == default_user and password == default_pass and default_pass:
+        st.session_state.authenticated = True
+        st.session_state.username = username
+
+        # Clear cached lists after login (safe)
+        try:
+            list_contractors.clear()
+            list_clients.clear()
+            list_payees.clear()
+            list_banks.clear()
+        except Exception:
+            pass
+
+        return True
+except Exception:
+    pass
+
     
     return False
 
