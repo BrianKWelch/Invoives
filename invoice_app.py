@@ -223,8 +223,7 @@ def authenticate_user(username: str, password: str) -> bool:
         if row and row[0] == password_hash:
             post_login()
             return True
-    except Exception:
-        pass
+    
 
     # 3) Dev fallback (env vars)
     try:
