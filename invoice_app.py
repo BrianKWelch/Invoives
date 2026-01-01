@@ -172,9 +172,10 @@ def authenticate_user(username: str, password: str) -> bool:
         return False
 
     username = username.strip().lower()
-    password_hash = hash_password(password)
+    password_plain = password
+    password_hash = hash_password(password_plain)
 
-    def post_login():
+    def post_login() -> None:
         st.session_state.authenticated = True
         st.session_state.username = username
         try:
@@ -188,15 +189,16 @@ def authenticate_user(username: str, password: str) -> bool:
     # 1) Streamlit secrets users
     try:
         users = st.secrets.get("users", None)
-            if users and username in users:
-                stored_hash = users[username]
-                if password_hash == stored_hash:
-                    post_login()
-                    return True
+        if isinstance(users, dict) and username in users:
+            stored_hash = users[username]
+            if password_hash == stored_hash:
+                post_login()
+                return True
     except Exception:
         pass
 
     # 2) Self-registered users in shared DB_PATH
+    conn = None
     try:
         db_path = os.path.abspath(DB_PATH)
         conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10.0)
@@ -217,28 +219,31 @@ def authenticate_user(username: str, password: str) -> bool:
 
         cur.execute("SELECT password_hash FROM users WHERE username = ?", (username,))
         row = cur.fetchone()
-        conn.close()
 
         if row and row[0] == password_hash:
             post_login()
             return True
     except Exception:
+        pass
+    finally:
         try:
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
 
     # 3) Dev fallback (env vars)
     try:
-        default_user = os.getenv("DEFAULT_USER", "")
+        default_user = os.getenv("DEFAULT_USER", "").strip().lower()
         default_pass = os.getenv("DEFAULT_PASS", "")
-        if username == default_user and password == default_pass and default_pass:
+        if default_pass and username == default_user and password_plain == default_pass:
             post_login()
             return True
     except Exception:
         pass
 
     return False
+
 
 
 
