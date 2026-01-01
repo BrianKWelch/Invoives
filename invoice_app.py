@@ -165,6 +165,8 @@ def register_user(username: str, password: str) -> tuple[bool, str]:
         if "streamlit" in str(e).lower() or "cloud" in str(e).lower():
             return False, f"Error during registration: {str(e)}"
         return False, f"Unexpected error: {str(e)}"
+    except Exeception:
+        pass
 
 def authenticate_user(username: str, password: str) -> bool:
     """Authenticate user against secrets and database"""
