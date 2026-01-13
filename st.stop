@@ -2464,22 +2464,23 @@ def main():
             st.info("⚠️ **Data Migration Available**")
             st.write("We found existing data from before authentication was added.")
             st.write("Would you like to migrate it to your account?")
-            col1, col2 = st.columns(2)
+            col1, col2 = st.sidebar.columns(2)
             with col1:
-                if st.button("✅ Yes, Migrate", key="migrate_yes"):
-                    st.session_state.migrate_now = True
+                if col1.button("Confirm logout", key="confirm_logout", type="primary"):
+                    st.session_state["authenticated"] = False
+                    st.session_state["username"] = None
+                    st.session_state["pending_logout"] = False
                     st.rerun()
+
             with col2:
-                if st.button("❌ Skip", key="migrate_no"):
-                    st.session_state[f'migrated_{st.session_state.username}'] = True
-                    st.session_state[f'migration_prompted_{st.session_state.username}'] = True
+                if col2.button("Cancel", key="cancel_logout"):
+                    st.session_state["pending_logout"] = False
                     st.rerun()
+           
             st.markdown("---")
         
-        if st.button("🚪 Logout", key="logout_btn"):
-            st.session_state.authenticated = False
-            st.session_state.username = None
-            st.rerun()
+               show_backup_restore_panel()
+                logout_flow()
         st.markdown("---")
     
     st.title("Solo Invoicing and Payments")
