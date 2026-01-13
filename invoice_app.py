@@ -2478,8 +2478,8 @@ def main():
                     st.rerun()
            
             st.markdown("---")
-                       show_backup_restore_panel()
-                       logout_flow()
+            show_backup_restore_panel()
+            logout_flow()
             st.markdown("---")
     
     st.title("Solo Invoicing and Payments")
