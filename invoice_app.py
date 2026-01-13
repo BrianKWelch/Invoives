@@ -384,7 +384,7 @@ def restore_db_from_upload() -> bool:
 
     return False
 
-def download_db_backup_ui(label: str = "Download DB backup") -> None:
+def download_db_backup_ui(label: str = "Download DB backup", key_suffix: str = "default") -> None:
     """
     Shows a download button for the current DB file.
     User saves it into OneDrive manually.
@@ -409,7 +409,7 @@ def download_db_backup_ui(label: str = "Download DB backup") -> None:
         data=db_bytes,
         file_name=filename,
         mime="application/octet-stream",
-        key=f"download_db_{ts}"
+        key=f"download_db_{key_suffix}"
     )
 
 def zip_and_download_pdfs_ui() -> None:
@@ -469,7 +469,7 @@ def show_backup_restore_panel() -> None:
                 st.rerun()
 
     st.sidebar.markdown("### Backup")
-    download_db_backup_ui("Download DB backup for OneDrive")
+    download_db_backup_ui("Download DB backup for OneDrive", key_suffix="sidebar_backup")
 
     with st.sidebar.expander("Download PDFs zip", expanded=False):
         zip_and_download_pdfs_ui()
@@ -489,7 +489,7 @@ def logout_flow() -> None:
             st.rerun()
     else:
         st.sidebar.warning("Before logging out, download your DB backup and save it to OneDrive.")
-        download_db_backup_ui("Download DB now, then confirm logout")
+        download_db_backup_ui("Download DB now, then confirm logout", key_suffix="logout_confirm")
 
         col1, col2 = st.sidebar.columns(2)
         with col1:
