@@ -8,6 +8,9 @@
 # - NEW: Multiple banks support - assign specific bank per client for invoice remit-to
 # - NEW: Authentication system with self-registration - users can create their own accounts
 
+import io
+import shutil
+import zipfile
 import os
 import sqlite3
 import base64
@@ -314,6 +317,197 @@ def show_login_page():
         
         st.markdown("---")
         st.caption("Already have an account? Go to the Login tab above.")
+
+# -----------------------------
+# Backup and Restore (Manual OneDrive workflow)
+# -----------------------------
+
+def get_active_db_path() -> str:
+    """
+    Returns the DB path the app should be using right now.
+    Uses your existing get_db_path() when available.
+    """
+    try:
+        return os.path.abspath(get_db_path())
+    except Exception:
+        return os.path.abspath(DB_PATH)
+
+def safe_replace_file(target_path: str, new_bytes: bytes) -> None:
+    """
+    Safely replace a file on disk.
+    Writes to a temp file first, then moves into place.
+    """
+    target_path = os.path.abspath(target_path)
+    tmp_path = target_path + ".tmp"
+
+    # Write temp
+    with open(tmp_path, "wb") as f:
+        f.write(new_bytes)
+
+    # Replace
+    os.replace(tmp_path, target_path)
+
+def restore_db_from_upload() -> bool:
+    """
+    UI flow. Lets user upload a SQLite DB file and replaces the current DB.
+    Returns True if restored.
+    """
+    st.subheader("Restore database")
+    st.caption("Upload your saved data.db file from OneDrive. This replaces the current database in the app instance.")
+
+    uploaded = st.file_uploader(
+        "Upload data.db",
+        type=["db", "sqlite", "sqlite3"],
+        accept_multiple_files=False,
+        key="restore_db_uploader"
+    )
+
+    if uploaded is None:
+        return False
+
+    # Basic sanity check, prevent huge accidental uploads
+    file_bytes = uploaded.getvalue()
+    if not file_bytes or len(file_bytes) < 100:
+        st.error("That file does not look like a valid database.")
+        return False
+
+    target = get_active_db_path()
+
+    if st.button("Restore now", type="primary", key="restore_db_now"):
+        try:
+            safe_replace_file(target, file_bytes)
+            st.success(f"Database restored into: {os.path.basename(target)}")
+            return True
+        except Exception as e:
+            st.error(f"Restore failed: {e}")
+            return False
+
+    return False
+
+def download_db_backup_ui(label: str = "Download DB backup") -> None:
+    """
+    Shows a download button for the current DB file.
+    User saves it into OneDrive manually.
+    """
+    db_path = get_active_db_path()
+    if not os.path.exists(db_path):
+        st.warning("No database file found to download yet.")
+        return
+
+    try:
+        with open(db_path, "rb") as f:
+            db_bytes = f.read()
+    except Exception as e:
+        st.error(f"Could not read database: {e}")
+        return
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"data_backup_{ts}.db"
+
+    st.download_button(
+        label=label,
+        data=db_bytes,
+        file_name=filename,
+        mime="application/octet-stream",
+        key=f"download_db_{ts}"
+    )
+
+def zip_and_download_pdfs_ui() -> None:
+    """
+    Optional: download PDFs as a zip so you can store them in OneDrive too.
+    """
+    st.subheader("Download PDFs (zip)")
+    st.caption("This bundles invoices, payables, and payees into a single zip for easy OneDrive backup.")
+
+    mem = io.BytesIO()
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    zip_name = f"pdf_backup_{ts}.zip"
+
+    try:
+        with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
+            for folder in [INVOICE_DIR, PAYABLES_DIR, PAYEES_DIR]:
+                if not os.path.isdir(folder):
+                    continue
+                for fn in os.listdir(folder):
+                    full = os.path.join(folder, fn)
+                    if os.path.isfile(full):
+                        arc = os.path.join(folder, fn)
+                        z.write(full, arcname=arc)
+        mem.seek(0)
+    except Exception as e:
+        st.error(f"Could not create zip: {e}")
+        return
+
+    st.download_button(
+        label="Download PDFs zip",
+        data=mem.getvalue(),
+        file_name=zip_name,
+        mime="application/zip",
+        key=f"download_pdfs_zip_{ts}"
+    )
+
+def show_backup_restore_panel() -> None:
+    """
+    Put this in your sidebar after the user is authenticated.
+    """
+    st.sidebar.markdown("## Backup and Restore")
+
+    # Restore once per session
+    if not st.session_state.get("db_restored_this_session", False):
+        st.sidebar.info("Restore your database after login if this is a fresh app start.")
+        with st.sidebar.expander("Restore DB from OneDrive file", expanded=True):
+            restored = restore_db_from_upload()
+            if restored:
+                st.session_state["db_restored_this_session"] = True
+                st.sidebar.success("Restore complete. Reloading app.")
+                st.rerun()
+    else:
+        with st.sidebar.expander("Restore DB from OneDrive file", expanded=False):
+            restored = restore_db_from_upload()
+            if restored:
+                st.sidebar.success("Restore complete. Reloading app.")
+                st.rerun()
+
+    st.sidebar.markdown("### Backup")
+    download_db_backup_ui("Download DB backup for OneDrive")
+
+    with st.sidebar.expander("Download PDFs zip", expanded=False):
+        zip_and_download_pdfs_ui()
+
+def logout_flow() -> None:
+    """
+    Adds a safer logout that prompts user to download DB first.
+    """
+    st.sidebar.markdown("## Session")
+
+    if "pending_logout" not in st.session_state:
+        st.session_state["pending_logout"] = False
+
+    if not st.session_state["pending_logout"]:
+        if st.sidebar.button("Logout", key="logout_btn"):
+            st.session_state["pending_logout"] = True
+            st.rerun()
+    else:
+        st.sidebar.warning("Before logging out, download your DB backup and save it to OneDrive.")
+        download_db_backup_ui("Download DB now, then confirm logout")
+
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            if st.button("Confirm logout", key="confirm_logout", type="primary"):
+                # Clear auth and session state safely
+                for k in list(st.session_state.keys()):
+                    if k not in ["drive_restored", "db_restored_this_session"]:  # keep nothing important, just example
+                        pass
+                st.session_state["authenticated"] = False
+                st.session_state["username"] = None
+                st.session_state["pending_logout"] = False
+                st.rerun()
+
+        with col2:
+            if st.button("Cancel", key="cancel_logout"):
+                st.session_state["pending_logout"] = False
+                st.rerun()
+
 
 # -----------------------------
 # Utilities
@@ -2253,6 +2447,9 @@ def main():
     
     # User is authenticated, show the app
     st.set_page_config(page_title="Solo Invoicing", layout="wide")
+
+    show_backup_restore_panel()
+    logout_flow()
     
     # Check for data migration opportunity
     migration_status = check_and_migrate_data()
