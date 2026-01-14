@@ -376,8 +376,28 @@ def restore_db_from_upload() -> bool:
     if st.button("Restore now", type="primary", key="restore_db_now"):
         try:
             safe_replace_file(target, file_bytes)
+
+            # Clear Streamlit caches so Contractors and Clients reload from the restored DB
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+
+            # Also clear any session state that might hold old lists
+            for k in ["contractors", "clients", "banks", "payees", "company_info"]:
+                if k in st.session_state:
+                    del st.session_state[k]
+
             st.success(f"Database restored into: {os.path.basename(target)}")
             return True
+            
+            
+        
         except Exception as e:
             st.error(f"Restore failed: {e}")
             return False
